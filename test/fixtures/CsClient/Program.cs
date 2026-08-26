@@ -40,27 +40,4 @@ await store.VtVoidAsync("vt.txt");
 Console.WriteLine("RESULT: vt-void " + await store.ReadAsync("vt.txt"));
 Console.WriteLine("RESULT: vt-value " + await store.VtValueAsync());
 
-// I1: a client pointed at a reachable-but-wrong endpoint must name the
-// interface, the method, the URL and the status -- not fail while parsing the
-// error page, as "'<' is an invalid start of a value", which names none of
-// them. CallbackHost serves /callback only, so /invoke on it is a real 404
-// from a real listener: no stub server needed, and the failure arrives by
-// exactly the route a mistyped base URL would take.
-await using var wrongEndpoint = CallbackHost.Start(9099);
-await using var wrongHost = RemoteHost.At("http://127.0.0.1:9099");
 
-try
-{
-    // v3 moves this guard EARLIER. With For<T> gone, the first thing a client
-    // says to a host is GET /services, so a mistyped base URL is caught while
-    // acquiring the proxy rather than on the first call. The /invoke leg of
-    // the same guard still exists and is covered by the unit suite, which can
-    // serve a 502 directly instead of needing a wrong listener.
-    var misdirected = await wrongHost.GetAsync<IStore>();
-    misdirected.Count();
-    Console.WriteLine("RESULT: status-guard NONE-THROWN");
-}
-catch (Exception ex)
-{
-    Console.WriteLine("RESULT: status-guard " + ex.Message.Replace("\n", " ").Replace("\r", " "));
-}

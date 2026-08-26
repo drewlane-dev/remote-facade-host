@@ -25,7 +25,20 @@ public sealed class StubHost(WebApplication app, string url, List<string> bodies
     public static Task<StubHost> Serving(string json, int status = 200) =>
         Serving(_ => (status, json));
 
-    public static async Task<StubHost> Serving(Func<string, (int Status, string Json)> respond)
+    /// <summary>
+    /// Serves GET /services with the given body and status, so RemoteHost's
+    /// acquisition path can be driven. POST still answers from
+    /// <paramref name="onPost"/>.
+    /// </summary>
+    public static Task<StubHost> ServingServices(
+        string servicesJson, int status = 200, string onPost = """{"ok":true,"result":null}""") =>
+        Serving(_ => (200, onPost), (status, servicesJson));
+
+    public static Task<StubHost> Serving(Func<string, (int Status, string Json)> respond) =>
+        Serving(respond, (200, "[]"));
+
+    public static async Task<StubHost> Serving(
+        Func<string, (int Status, string Json)> respond, (int Status, string Json) services)
     {
         var builder = WebApplication.CreateSlimBuilder();
         builder.Logging.ClearProviders();
@@ -45,6 +58,13 @@ public sealed class StubHost(WebApplication app, string url, List<string> bodies
             ctx.Response.StatusCode = status;
             ctx.Response.ContentType = "application/json";
             await ctx.Response.WriteAsync(json);
+        });
+
+        app.MapGet("/services", async (HttpContext ctx) =>
+        {
+            ctx.Response.StatusCode = services.Status;
+            ctx.Response.ContentType = "application/json";
+            await ctx.Response.WriteAsync(services.Json);
         });
 
         await app.StartAsync();

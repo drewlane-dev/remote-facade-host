@@ -7,7 +7,6 @@ var asmFile  = Environment.GetEnvironmentVariable("LIB_ASSEMBLY")
                ?? throw new InvalidOperationException("LIB_ASSEMBLY is required");
 var servicesJson = Environment.GetEnvironmentVariable("LIB_SERVICES") ?? "{}";
 var registrar = Environment.GetEnvironmentVariable("LIB_REGISTRAR");
-var callbacksJson = Environment.GetEnvironmentVariable("LIB_CALLBACKS") ?? "{}";
 var port     = Environment.GetEnvironmentVariable("LIB_PORT") ?? "8080";
 
 // The startup is the only way to say what to serve. Without it the container
@@ -62,7 +61,7 @@ PluginLoader.LoadAssembly(dir, asmFile);
 // One graph serves every call for the container's lifetime; that is what
 // allows a method to acquire a resource and a later call to release it.
 // InstanceHolder owns it so DELETE /instance can reset it between tests.
-var holder = new InstanceHolder(() => Activation.Build(registrar, servicesJson, callbacksJson));
+var holder = new InstanceHolder(() => Activation.Build(registrar, servicesJson));
 
 var builder = WebApplication.CreateBuilder(args);
 builder.WebHost.UseUrls($"http://0.0.0.0:{port}");
@@ -138,8 +137,7 @@ app.MapPost("/invoke", async (InvokeRequest request) =>
                 //
                 // That contradicts the property the rest of this protocol
                 // holds to -- Invoker guards everything after method lookup
-                // with catch (Exception), CallbackHost does the same in the
-                // reverse direction, and README's "Errors" section states
+                // with catch (Exception), and README's "Errors" section states
                 // outright that neither ever reaches the caller as a bare 500
                 // with an empty body. This path was the one exception.
                 //

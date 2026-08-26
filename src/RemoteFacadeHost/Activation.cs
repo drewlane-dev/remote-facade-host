@@ -28,12 +28,7 @@ public static class Activation
     /// "real wiring, one thing faked" is expressed without the plugin needing
     /// to know it is under test.
     /// </param>
-    /// <param name="callbacksJson">
-    /// Interface-to-URL map. Each named interface is served by a proxy that
-    /// calls BACK into the test process, so a mock can live where the
-    /// assertions are instead of being compiled into the plugin.
-    /// </param>
-    public static HostedGraph Build(string registrar, string servicesJson, string callbacksJson)
+    public static HostedGraph Build(string registrar, string servicesJson)
     {
         var services = new ServiceCollection();
         services.AddLogging();
@@ -61,30 +56,6 @@ public static class Activation
             // Replace, not Add: these are overrides on top of what the startup
             // already wired, and Replace says so unambiguously.
             services.Replace(ServiceDescriptor.Singleton(serviceType, implType));
-        }
-
-        var callbacks = JsonSerializer.Deserialize<Dictionary<string, string>>(
-                            string.IsNullOrWhiteSpace(callbacksJson) ? "{}" : callbacksJson)
-                        ?? [];
-
-        foreach (var (interfaceName, url) in callbacks)
-        {
-            // Ambiguous configuration fails loudly rather than resolving to
-            // whichever mechanism happened to be checked first.
-            if (map.ContainsKey(interfaceName))
-            {
-                throw new InvalidOperationException(
-                    $"'{interfaceName}' is named in BOTH LIB_SERVICES and LIB_CALLBACKS. " +
-                    "Use one or the other.");
-            }
-
-            var interfaceType = PluginLoader.Assembly?.GetType(interfaceName)
-                ?? throw new InvalidOperationException(
-                    $"LIB_CALLBACKS names '{interfaceName}', which is not in the assembly. " +
-                    $"Available: {string.Join(", ", PluginLoader.TypeNames())}");
-
-            services.Replace(ServiceDescriptor.Singleton(
-                interfaceType, CallbackProxy.Create(interfaceType, url)));
         }
 
         // Captured BEFORE building: a ServiceCollection is the list of

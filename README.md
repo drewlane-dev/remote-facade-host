@@ -21,6 +21,12 @@ written in your own code, that registers everything the container should serve.
 > environment variables, files, or anything else, with the real types rather
 > than through a JSON binder the host owns. Setting either removed variable to
 > a meaningful value is a fatal startup error rather than silently ignored.
+>
+> **Callbacks are also out for now.** `LIB_CALLBACKS`, `CallbackHost` and
+> `CallbackProxy` — which proxied a named dependency back into the test process
+> so a Moq mock could serve it — are removed from this release. The work is
+> preserved on the `callbacks` branch and may return. Substitute dependencies
+> with `LIB_SERVICES` (a fake compiled into the plugin) in the meantime.
 
 ## How it works
 
@@ -44,7 +50,7 @@ flowchart LR
     end
 
     out -- "bind mount" --> mnt
-    env["LIB_ASSEMBLY / LIB_REGISTRAR<br/>LIB_SERVICES / LIB_CALLBACKS"] -- "env vars" --> load
+    env["LIB_ASSEMBLY / LIB_REGISTRAR<br/>LIB_SERVICES"] -- "env vars" --> load
 
     inst -.-> shared[("shared state<br/>SMB share, SQL, ...")]
 ```
@@ -69,19 +75,12 @@ sequenceDiagram
     proxy->>host: POST /invoke<br/>{ method, args, service? }
     host->>real: match by name + arg count,<br/>deserialize args, invoke
 
-    real->>test: POST /callback<br/>a dependency named in LIB_CALLBACKS
-    test-->>real: the mock's return value
-
     real-->>host: return value,<br/>awaited if awaitable
     host-->>proxy: { ok: true, result }
     proxy-->>test: typed Task#lt;string#gt;
 
     Note over test,real: a throw comes back as { ok: false, error }<br/>and the proxy rethrows it
 ```
-
-The callback arrow is the reverse direction: a dependency you name in
-`LIB_CALLBACKS` is proxied *back* to your test process, so a mock stays where
-your assertions are instead of being stranded inside the container.
 
 ## Composition-root hosting
 
@@ -341,17 +340,6 @@ whatever arguments the caller sends.** There is no auth, no allowlist, no
 sandboxing beyond the container boundary. This image is for test networks
 only — never expose it to anything you don't fully trust.
 
-The callback listener has the same posture, in the other direction, and it runs
-in **your own test process** rather than in a container. `CallbackHost.Start(port)`
-binds `0.0.0.0:<port>` — every interface on the machine, not just loopback — and
-`POST /callback` is unauthenticated: anything that can reach that port can invoke
-the mocks you registered. Dispatch is restricted to the method table of the
-interface passed to `Serve<T>` (and the interfaces it inherits), so a target's
-other public methods, and `Object`'s own members such as `ToString()`, are not
-reachable — but everything the served interface declares is, with whatever
-arguments the caller sends. Run it on a trusted network only, and give it a port
-you are willing to expose for the lifetime of the fixture.
-
 ## Configuration
 
 | Variable | Default | Meaning |
@@ -360,7 +348,6 @@ you are willing to expose for the lifetime of the fixture.
 | `LIB_ASSEMBLY` | *(required)* | Assembly file name inside `LIB_DIR`, e.g. `CsLib.dll`. |
 | `LIB_SERVICES` | `{}` | JSON map of interface name to implementing type name, both resolved from the plugin assembly — see [Substituting a dependency](#substituting-a-dependency). |
 | `LIB_REGISTRAR` | **required** | `Namespace.Type.Method` naming a static method that takes an `IServiceCollection`. This is how a container is told what to serve. Runs *before* `LIB_SERVICES`, so the explicit map can still override anything it registers. Unset is a fatal startup error. |
-| `LIB_CALLBACKS` | `{}` | JSON map of interface name to an HTTP base URL on the test runner — see [Substituting a dependency](#substituting-a-dependency). |
 | `LIB_PORT` | `8080` | HTTP port the host listens on. |
 | `SMB_SERVER` | unset | SMB server to mount before serving. Must be set together with `SMB_SHARE`. |
 | `SMB_SHARE` | unset | Share name. |
@@ -582,40 +569,6 @@ it, and auto-registration of concrete types checks the service collection
 first so it never clobbers what the registrar (or `LIB_SERVICES`) already
 wired.
 
-**`LIB_CALLBACKS` — a real mock (e.g. Moq), living in the test process.**
-
-```
-LIB_CALLBACKS={"CsLib.IStamp":"http://testrunner:9090"}
-```
-
-A mock created in the test process can't be injected directly into an
-instance running in a container — that requires a call back into the test
-process. `LIB_CALLBACKS` maps an interface name to an HTTP base URL on the
-test runner; the host generates a proxy for that interface, and every call
-the remote instance makes on it is forwarded there. On the client side:
-
-```csharp
-var mock = new Mock<IStamp>();
-mock.Setup(s => s.Value()).Returns("from-moq");
-mock.Setup(s => s.CountAsync()).ReturnsAsync(42);
-mock.Setup(s => s.FailAsync()).ThrowsAsync(new InvalidOperationException("mock-says-no"));
-
-await using var callbacks = CallbackHost.Start(9090);
-callbacks.Serve<IStamp>(mock.Object);   // T must be an interface; Serve<T> throws otherwise
-```
-
-All four return shapes — `void`, `Task`, `T`, `Task<T>` — round-trip over the
-callback leg exactly as they do over `/invoke`, and an exception thrown by
-the mock propagates back into the remote instance's call with the mock's own
-`Message` intact. `Setup`, `Returns`, argument matchers, and `Verify` all work
-normally, because it's a real `Mock<T>` — the container just happens to be
-what's calling it.
-
-Naming the same interface in **both** `LIB_SERVICES` and `LIB_CALLBACKS` is a
-fatal startup error, not a precedence rule — ambiguous configuration should
-fail loudly rather than resolve to whichever mechanism happened to be checked
-first.
-
 ## A note for VB libraries
 
 VB **prepends** the project's `RootNamespace` to every declared namespace,
@@ -698,7 +651,7 @@ here.
 `test/run.sh <image-tag>` runs the self-test suite against real containers —
 constructing types (both modes), all four return shapes, instance reset,
 composition-root resolution and its failure modes, a two-container
-share-mounted scenario, `LIB_SERVICES`/`LIB_REGISTRAR`/`LIB_CALLBACKS`
+share-mounted scenario, `LIB_SERVICES`/`LIB_REGISTRAR`
 wiring, and the startup failure modes documented above:
 
 ```bash

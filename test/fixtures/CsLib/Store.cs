@@ -5,11 +5,10 @@ using Microsoft.Extensions.Options;
 namespace CsLib;
 
 // Value() exercises the "anything else, deserialised directly" shape.
-// CountAsync()/Ping()/FailAsync() exist so a callback-backed IStamp (a real
-// Moq mock in the test process, forwarded to via LIB_CALLBACKS) exercises
-// the same four return shapes as the forward direction, over that leg
-// specifically -- Task<T>, void, and Task (the last doubling as the
-// exception-fidelity case: a mock configured to throw).
+// CountAsync()/Ping()/FailAsync() exercise the same four return shapes as
+// Store's own members do -- Task<T>, void, and Task (the last doubling as the
+// exception-fidelity case) -- through a DEPENDENCY rather than the service
+// being called, so a substitution's return shapes are covered too.
 public interface IStamp
 {
     string Value();
@@ -17,11 +16,10 @@ public interface IStamp
     void Ping();
     Task FailAsync();
 
-    // The callback leg's twin of IStore.VtValueAsync/VtVoidAsync. A mock
-    // serving these over CallbackHost is the shape that used to be corrupted
-    // in THIS direction: ValueTask is a struct, so neither CallbackHost's
-    // dispatch nor CallbackProxy's result handling recognised it, and the
-    // library in the container received null with ok:true and no error.
+    // The dependency-side twin of IStore.VtValueAsync/VtVoidAsync. ValueTask
+    // is a struct, so it is the shape most easily mishandled by any dispatch
+    // that reasons about awaitables by reference -- a default ValueTask reads
+    // as a completed one carrying null, with no error anywhere.
     ValueTask<string> VtValueAsync();
     ValueTask VtPingAsync();
 }
@@ -50,10 +48,10 @@ public sealed class FakeStamp : IStamp
 }
 
 // A real IStamp implementation that ALSO exposes a public method the
-// interface does not declare. Exists so "the callback host serves only the
-// interface" can be tested NON-vacuously: probing for a method that exists
-// nowhere would pass even with the guard deleted, whereas Secret() is
-// genuinely present on the served object and genuinely outside IStamp.
+// interface does not declare. Exists so "only the interface is served" can be
+// tested NON-vacuously: probing for a method that exists nowhere would pass
+// even with the guard deleted, whereas Secret() is genuinely present on the
+// served object and genuinely outside IStamp.
 public sealed class SecretStamp : IStamp
 {
     public string Value() => "secret-stamp";
@@ -130,7 +128,7 @@ public interface IStore
     string Stamp();
 
     // Pass-throughs to IStamp's other members, so a client driving Store
-    // over /invoke can exercise a callback-backed IStamp's Task<T>, void,
+    // over /invoke can exercise a substituted IStamp's Task<T>, void,
     // and Task (throwing) shapes -- IStamp itself is never invoked directly
     // from the test process, only through Store.
     Task<int> StampCountAsync();
@@ -139,7 +137,7 @@ public interface IStore
 
     // The ValueTask pass-throughs. IStamp is never invoked directly from the
     // test process, only through Store, so these are how a raw /invoke can
-    // observe what the callback leg actually returned.
+    // observe what the dependency actually returned.
     ValueTask<string> StampVtValueAsync();
     ValueTask StampVtPingAsync();
 
@@ -859,8 +857,7 @@ public static class StoreStartup
         services.Configure<StoreOptions>(o => o.RootPath = root);
 
         // The default. LIB_SERVICES can still Replace it with FakeStamp or
-        // SecretStamp, and LIB_CALLBACKS can point it at a mock in the test
-        // process -- both apply after this method runs.
+        // SecretStamp, which applies after this method runs.
         services.AddSingleton<IStamp, RealStamp>();
 
         // Registered BOTH ways, resolving to ONE instance. v2 could name the

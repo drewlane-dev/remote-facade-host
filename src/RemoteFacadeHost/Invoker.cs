@@ -34,10 +34,6 @@ public static class Invoker
         // worked. Measured: {"ok":false,"error":"no method 'FromBase' taking 0
         // argument(s)"} against a live container.
         //
-        // This is the SAME ruling CallbackHost.cs makes in the reverse
-        // direction ("a member inherited from one IS part of the served
-        // contract"), reached the same way, deliberately: two files
-        // implementing one protocol must not resolve methods differently.
         // GetInterfaces() on an interface returns every ancestor
         // transitively, so one level of concatenation covers arbitrary depth.
         var candidates = type.IsInterface
@@ -219,8 +215,7 @@ public static class Invoker
             // and surface at the client as "JsonReaderException: The input
             // does not contain any JSON tokens" -- naming neither the
             // method nor the type. Same defect class already fixed for
-            // callback responses (Task 8 Finding 1) and for arguments
-            // (above): an error escaping the {ok,...} envelope and arriving
+            // arguments (above): an error escaping the {ok,...} envelope and arriving
             // unattributable. Pre-serializing to a JsonElement here means
             // the only thing Program.cs ever hands to Results.Ok is
             // already-valid JSON -- re-emitting a JsonElement cannot fail
