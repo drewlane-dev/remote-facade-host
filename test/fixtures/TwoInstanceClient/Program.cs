@@ -3,8 +3,10 @@ using RemoteFacadeHost.Client;
 
 // Two REAL instances, each in its own container with its own SMB mount and its
 // own SMB session. This is what the image exists for.
-IStore a = RemoteFacade.For<IStore>("http://ia:8080");
-IStore b = RemoteFacade.For<IStore>("http://ib:8080");
+await using var hostA = RemoteHost.At("http://ia:8080");
+await using var hostB = RemoteHost.At("http://ib:8080");
+var a = await hostA.GetAsync<IStore>();
+var b = await hostB.GetAsync<IStore>();
 
 await a.WriteAsync("shared.txt", "written-by-a");
 

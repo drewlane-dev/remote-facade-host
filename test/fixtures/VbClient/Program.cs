@@ -1,7 +1,8 @@
 using RemoteFacadeHost.Client;
 using VbLib;
 
-IVbStore store = RemoteFacade.For<IVbStore>("http://vb:8080");
+await using var vbHost = RemoteHost.At("http://vb:8080");
+var store = await vbHost.GetAsync<IVbStore>();
 
 Console.WriteLine("RESULT: vb-sync " + store.Describe());
 

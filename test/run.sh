@@ -21,7 +21,7 @@ cleanup() {
 trap cleanup EXIT
 docker network create "${NET}" >/dev/null
 
-start_host() { # start_host <alias> <pluginDir> <assembly> <type> <optionsJson> [servicesJson] [registrar] [callbacksJson]
+start_host() { # start_host <alias> <pluginDir> <assembly> <registrar> [servicesJson] [callbacksJson] [storeRoot] [sentinelPath]
   # DOTNET_EnableDiagnostics=0: belt-and-suspenders alongside giving the
   # plugin its own private RootPath (below) -- without it the runtime drops
   # its own diagnostic pipe/socket files straight into /tmp, which would
@@ -34,15 +34,17 @@ start_host() { # start_host <alias> <pluginDir> <assembly> <type> <optionsJson> 
   # parser closes the expansion at the FIRST "}" and leaves a stray "}"
   # behind in the shell word -- corrupting the value (to "...}}") even when
   # the positional argument IS set.
-  servicesJson="${6:-}"
+  servicesJson="${5:-}"
   [ -z "$servicesJson" ] && servicesJson='{}'
-  callbacksJson="${8:-}"
+  callbacksJson="${6:-}"
   [ -z "$callbacksJson" ] && callbacksJson='{}'
   docker run -d --rm --name "$1-${NET}" --network "${NET}" --network-alias "$1" \
     -v "$2:/plugin:ro" \
-    -e LIB_DIR=/plugin -e LIB_ASSEMBLY="$3" -e LIB_TYPE="$4" -e LIB_OPTIONS="$5" \
-    -e LIB_SERVICES="$servicesJson" -e LIB_REGISTRAR="${7:-}" \
+    -e LIB_DIR=/plugin -e LIB_ASSEMBLY="$3" -e LIB_REGISTRAR="$4" \
+    -e LIB_SERVICES="$servicesJson" \
     -e LIB_CALLBACKS="$callbacksJson" \
+    -e STORE_ROOT="${7:-/tmp}" \
+    -e SENTINEL_PATH="${8:-}" \
     -e DOTNET_EnableDiagnostics=0 \
     "$IMAGE" >/dev/null 2>&1
 }
@@ -85,7 +87,7 @@ wait_smb() {
 # running, then echoes its real exit code. Returns 1 (no output) if it is
 # still running after the timeout. Needs a container started WITHOUT --rm:
 # --rm deletes the container the instant it exits, before this can inspect
-# it, which is exactly the gap that let "unknown LIB_TYPE exits non-zero"
+# it, which is exactly the gap that let "a bad registrar exits non-zero"
 # pass for reasons other than the container actually exiting non-zero.
 wait_stopped() {
   for _ in $(seq 1 30); do
@@ -102,8 +104,8 @@ echo "== loads and constructs a C# class =="
 # A private subdirectory, not /tmp itself: /tmp also holds the .NET runtime's
 # own diagnostic pipe/socket files, which Store.Count() -- Directory.GetFiles
 # over RootPath -- would otherwise count as its own.
-start_host cs "${HERE}/publish/cslib" CsLib.dll CsLib.Store '{"RootPath":"/tmp/cslib-data"}' \
-  '{"CsLib.IStamp":"CsLib.RealStamp"}'
+start_host cs "${HERE}/publish/cslib" CsLib.dll CsLib.StoreStartup.Configure \
+  '{"CsLib.IStamp":"CsLib.RealStamp"}' '{}' /tmp/cslib-data
 if wait_healthy cs; then
   ok "host constructs the configured type"
 else
@@ -114,24 +116,6 @@ fi
 echo "== /types is a usable diagnostic =="
 api cs /types | grep -q "CsLib.Store" \
   && ok "/types lists the assembly's types" || bad "/types lists the assembly's types"
-
-echo "== a missing type fails fast =="
-# Not start_host: that uses --rm, which would remove the container the
-# instant it exits, before wait_stopped can read its real exit code. A
-# not-healthy poll alone can't distinguish "exited non-zero" (what we want
-# to prove) from "still running but slow" or "network alias flaked" — all
-# three used to report the same "ok".
-docker run -d --name "bad1-${NET}" --network "${NET}" --network-alias bad1 \
-  -v "${HERE}/publish/cslib:/plugin:ro" \
-  -e LIB_DIR=/plugin -e LIB_ASSEMBLY=CsLib.dll -e LIB_TYPE=CsLib.NoSuchType -e LIB_OPTIONS='{}' \
-  "$IMAGE" >/dev/null 2>&1
-if code="$(wait_stopped "bad1-${NET}")" && [ "$code" -ne 0 ]; then
-  ok "unknown LIB_TYPE exits non-zero"
-else
-  docker logs "bad1-${NET}" 2>&1 | tail -4
-  bad "unknown LIB_TYPE exits non-zero"
-fi
-docker rm -f "bad1-${NET}" >/dev/null 2>&1 || true
 
 echo "== all four return shapes over /invoke =="
 CLIENT_OUT=$(docker run --rm --network "${NET}" -v "${HERE}/..:/w" -w /w \
@@ -171,7 +155,7 @@ echo "== ValueTask and ValueTask<T> are awaited, not handed over as data =="
 # So assert the VALUE, on the wire and at the client. An {ok:true} assertion
 # alone passes against that null, which is exactly the trap.
 body=$(api cs /invoke -X POST -H 'Content-Type: application/json' \
-  -d '{"method":"VtValueAsync","args":[]}')
+  -d '{"service":"CsLib.Store","method":"VtValueAsync","args":[]}')
 # Compared as the WHOLE envelope, not grepped for '"result":"vt-value"'. The
 # broken shape CONTAINS that substring as a NESTED field --
 # {"ok":true,"result":{"isCompleted":false,...,"result":"vt-value"}} -- so a
@@ -197,19 +181,23 @@ echo "$CLIENT_OUT" | grep -q "RESULT: vt-void vt-written" \
   || bad "a plain ValueTask's work completes before the call returns"
 
 echo "== the client checks HTTP status before deserializing =="
-# The proxy is pointed at a real listener that does not serve /invoke, so the
-# response is a genuine 404. Deserializing that as the {ok, result} envelope
-# fails with "'<' is an invalid start of a value" (or, for an empty body, "the
-# input does not contain any JSON tokens") -- naming neither the interface, the
-# method, the URL nor the status. CallbackProxy already guards the other
-# direction exactly this way; both must fail the same.
+# The client is pointed at a real listener that does not serve this protocol,
+# so the response is a genuine 404. Deserializing that as JSON fails with
+# "'<' is an invalid start of a value" -- naming neither the URL, the status,
+# nor what was being asked for.
+#
+# v3 catches it EARLIER than v2 did. With For<T> gone the first thing a client
+# says to a host is GET /services, so a mistyped base URL fails while acquiring
+# the proxy rather than on the first call. The /invoke leg of the same guard is
+# unchanged and is covered by the unit suite, which serves a 502 directly
+# instead of needing a wrong listener.
 STATUS_LINE=$(echo "$CLIENT_OUT" | grep '^RESULT: status-guard' || true)
-if echo "$STATUS_LINE" | grep -q "IStore.Count" \
+if echo "$STATUS_LINE" | grep -q "/services" \
     && echo "$STATUS_LINE" | grep -q "404" \
     && echo "$STATUS_LINE" | grep -q "9099"; then
-  ok "a non-200 names the interface, the method, the URL and the status"
+  ok "a non-200 names the URL, the request and the status"
 else
-  bad "a non-200 names the interface, the method, the URL and the status (got: $STATUS_LINE)"
+  bad "a non-200 names the URL, the request and the status (got: $STATUS_LINE)"
 fi
 
 echo "== failures come back as {ok:false}, not a raw 500 =="
@@ -219,9 +207,9 @@ echo "== failures come back as {ok:false}, not a raw 500 =="
 # alone) lets it escape /invoke as an unhandled 500. FailAsync throws AFTER
 # yielding, so its exception can only ever be observed this way.
 code=$(api cs /invoke -X POST -H 'Content-Type: application/json' \
-  -d '{"method":"FailAsync","args":[]}' -o /dev/null -w '%{http_code}')
+  -d '{"service":"CsLib.Store","method":"FailAsync","args":[]}' -o /dev/null -w '%{http_code}')
 body=$(api cs /invoke -X POST -H 'Content-Type: application/json' \
-  -d '{"method":"FailAsync","args":[]}')
+  -d '{"service":"CsLib.Store","method":"FailAsync","args":[]}')
 if [ "$code" = "200" ] && echo "$body" | grep -q '"ok":false' \
                        && echo "$body" | grep -q "deliberate failure"; then
   ok "an async method's exception is reported as {ok:false}, not a 500"
@@ -233,9 +221,9 @@ fi
 # the parameter type -- that used to throw JsonException BEFORE the try,
 # uncaught.
 code=$(api cs /invoke -X POST -H 'Content-Type: application/json' \
-  -d '{"method":"Touch","args":[{"not":"a string"}]}' -o /dev/null -w '%{http_code}')
+  -d '{"service":"CsLib.Store","method":"Touch","args":[{"not":"a string"}]}' -o /dev/null -w '%{http_code}')
 body=$(api cs /invoke -X POST -H 'Content-Type: application/json' \
-  -d '{"method":"Touch","args":[{"not":"a string"}]}')
+  -d '{"service":"CsLib.Store","method":"Touch","args":[{"not":"a string"}]}')
 if [ "$code" = "200" ] && echo "$body" | grep -q '"ok":false' \
                        && echo "$body" | grep -q "argument 'name'"; then
   ok "a malformed argument is reported as {ok:false}, not a 500"
@@ -253,9 +241,9 @@ echo "== ref/out and open generic methods are rejected before they run =="
 # directly: it is InvalidOperationException, not NotSupportedException,
 # despite the message text reading like the latter.)
 code=$(api cs /invoke -X POST -H 'Content-Type: application/json' \
-  -d '{"method":"RefArg","args":[1]}' -o /dev/null -w '%{http_code}')
+  -d '{"service":"CsLib.Store","method":"RefArg","args":[1]}' -o /dev/null -w '%{http_code}')
 body=$(api cs /invoke -X POST -H 'Content-Type: application/json' \
-  -d '{"method":"RefArg","args":[1]}')
+  -d '{"service":"CsLib.Store","method":"RefArg","args":[1]}')
 if [ "$code" = "200" ] && echo "$body" | grep -q '"ok":false' \
                        && echo "$body" | grep -q "ref parameter 'x'"; then
   ok "a ref parameter is rejected by name, before the method ever runs"
@@ -268,9 +256,9 @@ fi
 # refusal -- System.InvalidOperationException naming the unbound generic
 # parameter ('T') -- but not this method or why it's unbound.
 code=$(api cs /invoke -X POST -H 'Content-Type: application/json' \
-  -d '{"method":"Echo","args":[1]}' -o /dev/null -w '%{http_code}')
+  -d '{"service":"CsLib.Store","method":"Echo","args":[1]}' -o /dev/null -w '%{http_code}')
 body=$(api cs /invoke -X POST -H 'Content-Type: application/json' \
-  -d '{"method":"Echo","args":[1]}')
+  -d '{"service":"CsLib.Store","method":"Echo","args":[1]}')
 if [ "$code" = "200" ] && echo "$body" | grep -q '"ok":false' \
                        && echo "$body" | grep -q "open generic method"; then
   ok "an open generic method is rejected by name, before the method ever runs"
@@ -288,9 +276,9 @@ echo "== a return value System.Text.Json can't serialize gets the same envelope 
 # nor the type. Assert the envelope directly, not just the status code: a
 # 500 alone wouldn't distinguish this from any other unguarded crash.
 code=$(api cs /invoke -X POST -H 'Content-Type: application/json' \
-  -d '{"method":"BadReturn","args":[]}' -o /dev/null -w '%{http_code}')
+  -d '{"service":"CsLib.Store","method":"BadReturn","args":[]}' -o /dev/null -w '%{http_code}')
 body=$(api cs /invoke -X POST -H 'Content-Type: application/json' \
-  -d '{"method":"BadReturn","args":[]}')
+  -d '{"service":"CsLib.Store","method":"BadReturn","args":[]}')
 if [ "$code" = "200" ] && echo "$body" | grep -q '"ok":false' \
                        && echo "$body" | grep -q "return value of 'BadReturn' (Type)"; then
   ok "a non-serializable return value is reported as {ok:false}, not an empty 500"
@@ -306,9 +294,9 @@ fi
 # BadReturn's alone would suggest) misses this one entirely; it must be
 # attributed exactly like BadReturn is.
 code=$(api cs /invoke -X POST -H 'Content-Type: application/json' \
-  -d '{"method":"StreamReturn","args":[]}' -o /dev/null -w '%{http_code}')
+  -d '{"service":"CsLib.Store","method":"StreamReturn","args":[]}' -o /dev/null -w '%{http_code}')
 body=$(api cs /invoke -X POST -H 'Content-Type: application/json' \
-  -d '{"method":"StreamReturn","args":[]}')
+  -d '{"service":"CsLib.Store","method":"StreamReturn","args":[]}')
 if [ "$code" = "200" ] && echo "$body" | grep -q '"ok":false' \
                        && echo "$body" | grep -q "return value of 'StreamReturn' (Stream)"; then
   ok "a Stream return value is attributed, not left with a misleading message"
@@ -322,9 +310,9 @@ fi
 # InvalidOperationException) exactly the way the return-side catch missed
 # StreamReturn above.
 code=$(api cs /invoke -X POST -H 'Content-Type: application/json' \
-  -d '{"method":"TypeArg","args":["x"]}' -o /dev/null -w '%{http_code}')
+  -d '{"service":"CsLib.Store","method":"TypeArg","args":["x"]}' -o /dev/null -w '%{http_code}')
 body=$(api cs /invoke -X POST -H 'Content-Type: application/json' \
-  -d '{"method":"TypeArg","args":["x"]}')
+  -d '{"service":"CsLib.Store","method":"TypeArg","args":["x"]}')
 if [ "$code" = "200" ] && echo "$body" | grep -q '"ok":false' \
                        && echo "$body" | grep -q "argument 't' (Type)"; then
   ok "a non-deserializable argument is attributed, whatever exception it throws"
@@ -347,10 +335,10 @@ invoke_result() { # invoke_result <methodJsonBody> -- extracts the numeric "resu
     | grep -o '"result":[0-9]*' | grep -o '[0-9]*$' || true
 }
 api cs /invoke -X POST -H 'Content-Type: application/json' \
-  -d '{"method":"Lock","args":[]}' >/dev/null
-before=$(invoke_result '{"method":"LockCount","args":[]}')
+  -d '{"service":"CsLib.Store","method":"Lock","args":[]}' >/dev/null
+before=$(invoke_result '{"service":"CsLib.Store","method":"LockCount","args":[]}')
 code=$(api cs /instance -X DELETE -o /dev/null -w '%{http_code}')
-after=$(invoke_result '{"method":"LockCount","args":[]}')
+after=$(invoke_result '{"service":"CsLib.Store","method":"LockCount","args":[]}')
 if [ "$code" = "204" ] && [ "$before" = "1" ] && [ "$after" = "0" ]; then
   ok "DELETE /instance resets the object"
 else
@@ -360,7 +348,7 @@ api cs /health | grep -q "CsLib.Store" \
   && ok "host still serves after a reset" || bad "host still serves after a reset"
 
 echo "== the same image serves a VB library, unchanged =="
-start_host vb "${HERE}/publish/vblib" VbLib.dll VbLib.VbStore '{"RootPath":"/tmp"}'
+start_host vb "${HERE}/publish/vblib" VbLib.dll VbLib.VbStartup.Configure '{}' '{}' /tmp
 if wait_healthy vb; then
   ok "host constructs a VB type"
 else
@@ -387,8 +375,8 @@ for n in ia ib; do
   docker run -d --rm --name "$n-${NET}" --network "${NET}" --network-alias "$n" \
     --cap-add SYS_ADMIN --cap-add DAC_READ_SEARCH --security-opt apparmor=unconfined \
     -v "${HERE}/publish/cslib:/plugin:ro" \
-    -e LIB_DIR=/plugin -e LIB_ASSEMBLY=CsLib.dll -e LIB_TYPE=CsLib.Store \
-    -e LIB_OPTIONS='{"RootPath":"/mnt/share"}' \
+    -e LIB_DIR=/plugin -e LIB_ASSEMBLY=CsLib.dll \
+    -e LIB_REGISTRAR=CsLib.StoreStartup.Configure -e STORE_ROOT=/mnt/share \
     -e LIB_SERVICES='{"CsLib.IStamp":"CsLib.RealStamp"}' \
     -e SMB_SERVER=samba -e SMB_SHARE=data \
     "$IMAGE" >/dev/null 2>&1
@@ -441,7 +429,7 @@ echo "== a misconfigured mount is fatal, not silently skipped =="
 # exit code can still be inspected after it exits.
 docker run -d --name "badhost-${NET}" --network "${NET}" \
   -v "${HERE}/publish/cslib:/plugin:ro" \
-  -e LIB_DIR=/plugin -e LIB_ASSEMBLY=CsLib.dll -e LIB_TYPE=CsLib.Store -e LIB_OPTIONS='{}' \
+  -e LIB_DIR=/plugin -e LIB_ASSEMBLY=CsLib.dll -e LIB_REGISTRAR=CsLib.StoreStartup.Configure \
   --cap-add SYS_ADMIN --cap-add DAC_READ_SEARCH --security-opt apparmor=unconfined \
   -e SMB_SERVER=no-such-smb-host -e SMB_SHARE=data \
   "$IMAGE" >/dev/null 2>&1
@@ -460,7 +448,7 @@ docker rm -f "badhost-${NET}" >/dev/null 2>&1 || true
 # --cap-add here: this must fail before ever calling `mount`.
 docker run -d --name "badcfg-${NET}" --network "${NET}" \
   -v "${HERE}/publish/cslib:/plugin:ro" \
-  -e LIB_DIR=/plugin -e LIB_ASSEMBLY=CsLib.dll -e LIB_TYPE=CsLib.Store -e LIB_OPTIONS='{}' \
+  -e LIB_DIR=/plugin -e LIB_ASSEMBLY=CsLib.dll -e LIB_REGISTRAR=CsLib.StoreStartup.Configure \
   -e SMB_SERVER=samba \
   "$IMAGE" >/dev/null 2>&1
 if code="$(wait_stopped "badcfg-${NET}")" && [ "$code" -ne 0 ]; then
@@ -472,113 +460,66 @@ fi
 docker rm -f "badcfg-${NET}" >/dev/null 2>&1 || true
 
 echo "== service registration =="
-start_host stampreal "${HERE}/publish/cslib" CsLib.dll CsLib.Store '{"RootPath":"/tmp"}' \
+start_host stampreal "${HERE}/publish/cslib" CsLib.dll CsLib.StoreStartup.Configure \
   '{"CsLib.IStamp":"CsLib.RealStamp"}'
 wait_healthy stampreal \
   && ok "constructs a type with a registered dependency" \
   || bad "constructs a type with a registered dependency"
 
 api stampreal /invoke -X POST -H 'Content-Type: application/json' \
-  -d '{"method":"Stamp","args":[]}' | grep -q '"result":"real"' \
+  -d '{"service":"CsLib.Store","method":"Stamp","args":[]}' | grep -q '"result":"real"' \
   && ok "resolves the registered implementation" || bad "resolves the registered implementation"
 
 # The same library, a different implementation, no rebuild: this is how you
 # substitute a fake for a dependency.
-start_host stampfake "${HERE}/publish/cslib" CsLib.dll CsLib.Store '{"RootPath":"/tmp"}' \
+start_host stampfake "${HERE}/publish/cslib" CsLib.dll CsLib.StoreStartup.Configure \
   '{"CsLib.IStamp":"CsLib.FakeStamp"}'
 wait_healthy stampfake >/dev/null 2>&1
 api stampfake /invoke -X POST -H 'Content-Type: application/json' \
-  -d '{"method":"Stamp","args":[]}' | grep -q '"result":"fake"' \
+  -d '{"service":"CsLib.Store","method":"Stamp","args":[]}' | grep -q '"result":"fake"' \
   && ok "a fake can be substituted by configuration alone" \
   || bad "a fake can be substituted by configuration alone"
 
-echo "== a concrete dependency needs no registration, and can still be swapped =="
-# CsLib.Store takes IStamp (an interface), but a real library often takes a
-# concrete class. Nested.Outer(Nested.Inner) proves both halves: Inner resolves
-# with no config, and can be replaced by a subclass with one line.
-start_host nested "${HERE}/publish/cslib" CsLib.dll CsLib.Outer '{}' \
-  '{"CsLib.IStamp":"CsLib.RealStamp"}'
-wait_healthy nested \
-  && ok "concrete dependency resolves with no registration" \
-  || bad "concrete dependency resolves with no registration"
-
-api nested /invoke -X POST -H 'Content-Type: application/json' \
-  -d '{"method":"Describe","args":[]}' | grep -q '"result":"inner-real"' \
-  && ok "the real concrete dependency was used" || bad "the real concrete dependency was used"
-
-start_host nestedfake "${HERE}/publish/cslib" CsLib.dll CsLib.Outer '{}' \
-  '{"CsLib.IStamp":"CsLib.RealStamp","CsLib.Inner":"CsLib.FakeInner"}'
-wait_healthy nestedfake >/dev/null 2>&1
-api nestedfake /invoke -X POST -H 'Content-Type: application/json' \
-  -d '{"method":"Describe","args":[]}' | grep -q '"result":"inner-fake"' \
-  && ok "a concrete dependency can be replaced by a subclass" \
-  || bad "a concrete dependency can be replaced by a subclass"
-
 echo "== LIB_REGISTRAR wires the graph from the app's own code =="
-start_host reg "${HERE}/publish/cslib" CsLib.dll CsLib.Store '{"RootPath":"/tmp"}' '{}' \
-  CsLib.Registration.AddCsLib
+start_host reg "${HERE}/publish/cslib" CsLib.dll CsLib.Registration.AddCsLib
 wait_healthy reg \
   && ok "registrar supplies dependencies with no LIB_SERVICES" \
   || bad "registrar supplies dependencies with no LIB_SERVICES"
 
 api reg /invoke -X POST -H 'Content-Type: application/json' \
-  -d '{"method":"Stamp","args":[]}' | grep -q '"result":"real"' \
+  -d '{"service":"CsLib.Store","method":"Stamp","args":[]}' | grep -q '"result":"real"' \
   && ok "registrar's registration is used" || bad "registrar's registration is used"
 
 # The combination that matters: real wiring, one thing faked.
-start_host regfake "${HERE}/publish/cslib" CsLib.dll CsLib.Store '{"RootPath":"/tmp"}' \
-  '{"CsLib.IStamp":"CsLib.FakeStamp"}' CsLib.Registration.AddCsLib
+start_host regfake "${HERE}/publish/cslib" CsLib.dll CsLib.Registration.AddCsLib \
+  '{"CsLib.IStamp":"CsLib.FakeStamp"}'
 wait_healthy regfake >/dev/null 2>&1
 api regfake /invoke -X POST -H 'Content-Type: application/json' \
-  -d '{"method":"Stamp","args":[]}' | grep -q '"result":"fake"' \
+  -d '{"service":"CsLib.Store","method":"Stamp","args":[]}' | grep -q '"result":"fake"' \
   && ok "LIB_SERVICES overrides the registrar" || bad "LIB_SERVICES overrides the registrar"
 
-echo "== auto-registration does not clobber the registrar's own wiring =="
-# Configured is registered by AddCsLib with a FACTORY (ConfiguredFromFactory),
-# and also appears as NeedsConfigured's nested constructor parameter. Before
-# the fix, the concrete-dependency walk didn't check whether the container
-# already had a descriptor for a type -- only whether LIB_SERVICES named it --
-# so it re-registered Configured as a plain AddSingleton(pt, pt), and since the
-# container resolves the LAST matching descriptor, that silently threw away
-# the registrar's factory in favour of Configured's own (trivial)
-# construction. "factory" here, not "default", proves the registrar's
-# descriptor survived the walk.
-start_host regconfigured "${HERE}/publish/cslib" CsLib.dll CsLib.NeedsConfigured '{}' '{}' \
-  CsLib.Registration.AddCsLib
-wait_healthy regconfigured \
-  && ok "constructs a type with a registrar-supplied concrete dependency" \
-  || bad "constructs a type with a registrar-supplied concrete dependency"
+echo "== an unregistered dependency is named when the call needs it =="
+# v2 caught this at startup: LIB_TYPE made the host construct the root before
+# serving, so a missing dependency killed the container. v3 resolves per call,
+# so the container starts fine and the mistake surfaces at the first call that
+# needs the missing type. Later, but with the same name in the message -- and
+# the host no longer has to guess what will be asked for in order to check it.
+start_host stampmissing "${HERE}/publish/cslib" CsLib.dll CsLib.IncompleteStartup.Configure
+wait_healthy stampmissing \
+  && ok "a host with incomplete wiring still starts -- resolution is per call" \
+  || bad "a host with incomplete wiring still starts -- resolution is per call"
 
-api regconfigured /invoke -X POST -H 'Content-Type: application/json' \
-  -d '{"method":"Describe","args":[]}' | grep -q '"result":"factory"' \
-  && ok "auto-registration does not clobber the registrar's factory wiring" \
-  || bad "auto-registration does not clobber the registrar's factory wiring"
-
-echo "== an unregistered dependency still fails fast =="
-# Not start_host: --rm would delete the container the instant it exits,
-# before wait_stopped could read its real exit code -- the same gap
-# "unknown LIB_TYPE exits non-zero" and the mount-fatal cases below guard
-# against. Started directly, without --rm, so both the exit code and the
-# logs survive long enough to inspect.
-docker run -d --name "stampmissing-${NET}" --network "${NET}" --network-alias stampmissing \
-  -v "${HERE}/publish/cslib:/plugin:ro" \
-  -e LIB_DIR=/plugin -e LIB_ASSEMBLY=CsLib.dll -e LIB_TYPE=CsLib.Store -e LIB_OPTIONS='{"RootPath":"/tmp"}' \
-  -e LIB_SERVICES='{}' \
-  "$IMAGE" >/dev/null 2>&1
-if code="$(wait_stopped "stampmissing-${NET}")" && [ "$code" -ne 0 ]; then
-  ok "unregistered dependency exits non-zero"
-else
-  docker logs "stampmissing-${NET}" 2>&1 | tail -4
-  bad "unregistered dependency exits non-zero"
-fi
-docker logs "stampmissing-${NET}" 2>&1 | grep -q "IStamp" \
+MISSING_OUT=$(api_service stampmissing CsLib.Store Stamp)
+echo "$MISSING_OUT" | grep -q '"ok":false' \
+  && ok "the call fails rather than returning a wrong answer" \
+  || bad "the call fails rather than returning a wrong answer (got: $MISSING_OUT)"
+echo "$MISSING_OUT" | grep -q "IStamp" \
   && ok "the failure names the unsatisfiable dependency" \
-  || bad "the failure names the unsatisfiable dependency"
-docker rm -f "stampmissing-${NET}" >/dev/null 2>&1 || true
+  || bad "the failure names the unsatisfiable dependency (got: $MISSING_OUT)"
 
 echo "== callback proxies: a Moq mock serving a remote instance =="
-start_host cb "${HERE}/publish/cslib" CsLib.dll CsLib.Store '{"RootPath":"/tmp/cb-data"}' '{}' '' \
-  '{"CsLib.IStamp":"http://testrunner:9090"}'
+start_host cb "${HERE}/publish/cslib" CsLib.dll CsLib.StoreStartup.Configure '{}' \
+  '{"CsLib.IStamp":"http://testrunner:9090"}' /tmp/cb-data
 wait_healthy cb && ok "host starts with a callback-backed dependency" \
               || bad "host starts with a callback-backed dependency"
 
@@ -681,8 +622,8 @@ echo "== naming an interface in both mechanisms is a startup error =="
 # the full 30s poll, where wait_stopped returns as soon as the process exits.
 docker run -d --name "cbdup-${NET}" --network "${NET}" --network-alias cbdup \
   -v "${HERE}/publish/cslib:/plugin:ro" \
-  -e LIB_DIR=/plugin -e LIB_ASSEMBLY=CsLib.dll -e LIB_TYPE=CsLib.Store \
-  -e LIB_OPTIONS='{"RootPath":"/tmp/d"}' \
+  -e LIB_DIR=/plugin -e LIB_ASSEMBLY=CsLib.dll \
+  -e LIB_REGISTRAR=CsLib.StoreStartup.Configure -e STORE_ROOT=/tmp/d \
   -e LIB_SERVICES='{"CsLib.IStamp":"CsLib.FakeStamp"}' \
   -e LIB_CALLBACKS='{"CsLib.IStamp":"http://testrunner:9090"}' \
   "$IMAGE" >/dev/null 2>&1
@@ -697,388 +638,22 @@ docker logs "cbdup-${NET}" 2>&1 | grep -q "named in BOTH" \
   || bad "the failure names both mechanisms as the cause"
 docker rm -f "cbdup-${NET}" >/dev/null 2>&1 || true
 
-echo "== the provider builds the root when it knows how =="
-start_host factoryroot "${HERE}/publish/cslib" CsLib.dll CsLib.StringRooted '{}' '{}' \
-  CsLib.GraphStartup.Configure
-wait_healthy factoryroot && ok "a factory-registered root type constructs" \
-                         || bad "a factory-registered root type constructs"
-body=$(api factoryroot /invoke -X POST -H 'Content-Type: application/json' \
-  -d '{"method":"Label","args":[]}')
-[ "$body" = '{"ok":true,"result":"from-factory"}' ] \
-  && ok "the factory's value reached the instance" \
-  || bad "the factory's value reached the instance"
-
-echo "== LIB_TYPE may name an interface =="
-start_host ifaceroot "${HERE}/publish/cslib" CsLib.dll CsLib.IRootFacade '{}' '{}' \
-  CsLib.GraphStartup.Configure
-wait_healthy ifaceroot && ok "an interface as LIB_TYPE resolves" \
-                      || bad "an interface as LIB_TYPE resolves"
-body=$(api ifaceroot /invoke -X POST -H 'Content-Type: application/json' \
-  -d '{"method":"Who","args":[]}')
-[ "$body" = '{"ok":true,"result":"root-facade"}' ] \
-  && ok "the registered implementation served the call" \
-  || bad "the registered implementation served the call"
-
-echo "== an interface LIB_TYPE reaches members it INHERITS (review final, C1) =="
-# Type.GetMethods() on an INTERFACE returns only what that interface itself
-# DECLARES -- base-interface members are absent, unlike for a class. Both of
-# v1.1's new dispatch paths target an interface, so IBaseFacade.FromBase()
-# was unreachable through IDerivedFacade while FromDerived() worked.
-# FromDerived is asserted too, as the paired positive control: without it a
-# FromBase failure could not be told apart from the fixture not being
-# reachable at all.
-start_host derivedroot "${HERE}/publish/cslib" CsLib.dll CsLib.IDerivedFacade '{}' '{}' \
-  CsLib.GraphStartup.Configure
-wait_healthy derivedroot && ok "an interface WITH a base interface resolves as LIB_TYPE" \
-                        || bad "an interface WITH a base interface resolves as LIB_TYPE"
-body=$(api derivedroot /invoke -X POST -H 'Content-Type: application/json' \
-  -d '{"method":"FromDerived","args":[]}')
-[ "$body" = '{"ok":true,"result":"derived-method"}' ] \
-  && ok "a DECLARED member of an interface LIB_TYPE is callable" \
-  || bad "a DECLARED member of an interface LIB_TYPE is callable (got: $body)"
-body=$(api derivedroot /invoke -X POST -H 'Content-Type: application/json' \
-  -d '{"method":"FromBase","args":[]}')
-[ "$body" = '{"ok":true,"result":"base-method"}' ] \
-  && ok "an INHERITED member of an interface LIB_TYPE is callable" \
-  || bad "an INHERITED member of an interface LIB_TYPE is callable (got: $body)"
-
-echo "== an interface LIB_TYPE honours LIB_OPTIONS (review final, C2) =="
-# An interface has no constructor, so binding IOptions<T> off the ROOT's
-# constructor skipped the whole block and CsLib.Store received a
-# DEFAULT-constructed StoreOptions -- ok:true, no warning, and every write
-# landing in /tmp instead of the configured RootPath. Measured before the
-# fix, same image and same LIB_OPTIONS: the concrete LIB_TYPE wrote to
-# /tmp/opt-check, the interface one wrote to /tmp.
-#
-# Both halves are checked server-side, inside the container: the file IS at
-# the configured path AND is NOT at the default. The second is what makes
-# this non-vacuous -- StoreOptions' default is /tmp, so "the write succeeded"
-# was true against the bug too.
-start_host ifaceopts "${HERE}/publish/cslib" CsLib.dll CsLib.IStore \
-  '{"RootPath":"/tmp/opt-check"}' '{"CsLib.IStore":"CsLib.Store","CsLib.IStamp":"CsLib.RealStamp"}'
-wait_healthy ifaceopts && ok "an interface LIB_TYPE with LIB_OPTIONS starts" \
-                      || bad "an interface LIB_TYPE with LIB_OPTIONS starts"
-body=$(api ifaceopts /invoke -X POST -H 'Content-Type: application/json' \
-  -d '{"method":"WriteAsync","args":["opt.txt","hello"]}')
-[ "$body" = '{"ok":true,"result":null}' ] \
-  && ok "the interface-hosted implementation served the write" \
-  || bad "the interface-hosted implementation served the write (got: $body)"
-docker exec "ifaceopts-${NET}" sh -c 'test -f /tmp/opt-check/opt.txt' \
-  && ok "LIB_OPTIONS reached the implementation behind an interface LIB_TYPE" \
-  || bad "LIB_OPTIONS reached the implementation behind an interface LIB_TYPE"
-docker exec "ifaceopts-${NET}" sh -c 'test ! -f /tmp/opt.txt' \
-  && ok "the write did NOT land at StoreOptions' own default path" \
-  || bad "the write did NOT land at StoreOptions' own default path"
-
-echo "== a LIB_OPTIONS that cannot be bound is fatal, not silently discarded =="
-# The one shape left after the fix: an interface LIB_TYPE whose
-# implementation is supplied ONLY by LIB_REGISTRAR. Finding it would mean
-# inspecting ServiceDescriptors, which this codebase deliberately does not do
-# (see Activation.cs's ownership comment), so the host says so at startup
-# rather than quietly serving default options -- which is the failure the
-# whole finding is about.
-#
-# CsLib.IStore via OptionsFacadeStartup, deliberately, NOT the IRootFacade
-# this case first used: RootFacade takes no options at all, so that version
-# could not tell "refused because no implementation was NAMED" (the only
-# licensed reason) from "refused because nothing ASKED for options" (which
-# fired on correct configurations too -- see the two cases below). Store
-# genuinely takes IOptions<StoreOptions>, so this exercises the guard for the
-# reason it exists.
-docker run -d --name "optsblind-${NET}" --network "${NET}" \
-  -v "${HERE}/publish/cslib:/plugin:ro" \
-  -e LIB_DIR=/plugin -e LIB_ASSEMBLY=CsLib.dll -e LIB_TYPE=CsLib.IStore \
-  -e LIB_OPTIONS='{"RootPath":"/tmp/nowhere"}' \
-  -e LIB_REGISTRAR=CsLib.OptionsFacadeStartup.Configure \
-  -e DOTNET_EnableDiagnostics=0 \
-  "$IMAGE" >/dev/null 2>&1
-if code="$(wait_stopped "optsblind-${NET}")" && [ "$code" -ne 0 ]; then
-  ok "an unbindable LIB_OPTIONS exits non-zero instead of using defaults"
-else
-  bad "an unbindable LIB_OPTIONS exits non-zero instead of using defaults"
-fi
-docker logs "optsblind-${NET}" 2>&1 | grep -q "LIB_OPTIONS" \
-  && docker logs "optsblind-${NET}" 2>&1 | grep -q "LIB_SERVICES" \
-  && ok "the unbindable-options failure names LIB_OPTIONS and the way out" \
-  || bad "the unbindable-options failure names LIB_OPTIONS and the way out"
-docker rm -f "optsblind-${NET}" >/dev/null 2>&1 || true
-
-echo "== that guard does NOT fire when LIB_SERVICES really does name the implementation =="
-# The guard's job is "no implementation is identifiable". Whether that
-# implementation happens to want an IOptions<T> is a different question, and
-# conflating the two made this exact configuration -- an interface root with
-# a perfectly good LIB_SERVICES mapping -- die at startup telling the
-# operator to add the mapping they had already added.
-#
-# RootFacade taking NO options is the point of the case, not an oversight:
-# it is the only way to separate the two conditions. The ifaceopts case above
-# already covers a mapped implementation that DOES take options, and passed
-# either way, which is why it could not catch this.
-start_host ifacemapped "${HERE}/publish/cslib" CsLib.dll CsLib.IRootFacade \
-  '{"RootPath":"/tmp/unused"}' '{"CsLib.IRootFacade":"CsLib.RootFacade"}'
-wait_healthy ifacemapped \
-  && ok "an interface LIB_TYPE mapped in LIB_SERVICES starts despite a non-empty LIB_OPTIONS" \
-  || bad "an interface LIB_TYPE mapped in LIB_SERVICES starts despite a non-empty LIB_OPTIONS"
-# `|| true` on this one assignment, unlike its neighbours: this is the case
-# whose container is ABSENT when the guard misfires (start_host uses --rm, so
-# a host that dies at startup leaves nothing behind). Unguarded under
-# `set -eu`, curl's connection failure aborts the whole suite here -- which,
-# because `trap cleanup EXIT` ends in `|| true`, exits 0 and reports SUCCESS.
-# Observed exactly that while verifying this case by reverting the fix.
-body=$(api ifacemapped /invoke -X POST -H 'Content-Type: application/json' \
-  -d '{"method":"Who","args":[]}' || true)
-[ "$body" = '{"ok":true,"result":"root-facade"}' ] \
-  && ok "and it actually serves calls" \
-  || bad "and it actually serves calls (got: $body)"
-
-echo "== nor when the root is a CLASS that simply cannot be constructed =="
-# A type with only a private constructor also has no public constructor, so a
-# guard keyed on "has no constructor" swallowed it and reported an options
-# problem instead of the real one. The accurate message names the type and
-# the constructor; the wrong one names LIB_OPTIONS. Both halves are asserted,
-# because "exits non-zero" is true either way -- that is exactly how the
-# pre-existing privctor case above stayed green through this.
-docker run -d --name "privctoropts-${NET}" --network "${NET}" \
-  -v "${HERE}/publish/cslib:/plugin:ro" \
-  -e LIB_DIR=/plugin -e LIB_ASSEMBLY=CsLib.dll -e LIB_TYPE=CsLib.PrivateCtorRoot \
-  -e LIB_OPTIONS='{"RootPath":"/tmp/nowhere"}' \
-  -e DOTNET_EnableDiagnostics=0 \
-  "$IMAGE" >/dev/null 2>&1
-if code="$(wait_stopped "privctoropts-${NET}")" && [ "$code" -ne 0 ]; then
-  ok "an unconstructible class with a non-empty LIB_OPTIONS still exits non-zero"
-else
-  bad "an unconstructible class with a non-empty LIB_OPTIONS still exits non-zero"
-fi
-docker logs "privctoropts-${NET}" 2>&1 | grep -qi "suitable constructor" \
-  && ok "it fails with the CONSTRUCTOR message, which names the real mistake" \
-  || bad "it fails with the CONSTRUCTOR message, which names the real mistake"
-docker logs "privctoropts-${NET}" 2>&1 | grep -q "LIB_OPTIONS is set" \
-  && bad "the options guard must not mask the constructor failure" \
-  || ok "the options guard does not mask the constructor failure"
-docker rm -f "privctoropts-${NET}" >/dev/null 2>&1 || true
-
-echo "== DELETE /instance disposes an IDisposable root (review r1, finding 1) =="
-# ActivatorUtilities-constructed (no LIB_REGISTRAR): nothing tracks this
-# instance but HostedGraph itself, so IF it were not disposed there, it would
-# never be disposed at all. The sentinel is a file INSIDE the container --
-# checked via docker exec, the same server-side-truth technique the samba
-# tests already use -- because that is where Dispose() actually runs.
-start_host disposeau "${HERE}/publish/cslib" CsLib.dll CsLib.DisposableRoot \
-  '{"SentinelPath":"/tmp/disposed-au"}' '{}'
-wait_healthy disposeau && ok "a disposable root constructs" \
-                       || bad "a disposable root constructs"
-
-docker exec "disposeau-${NET}" sh -c 'test ! -f /tmp/disposed-au' \
-  && ok "not disposed before DELETE /instance" \
-  || bad "not disposed before DELETE /instance"
-
-code=$(api disposeau /instance -X DELETE -o /dev/null -w '%{http_code}')
-[ "$code" = "204" ] \
-  && ok "DELETE /instance returns 204 for a disposable root" \
-  || bad "DELETE /instance returns 204 for a disposable root (code=$code)"
-
-# Compared as the WHOLE file content, not grepped for the substring
-# "disposed": a bare grep would also pass if Dispose() ran TWICE, which is
-# exactly what the next block exists to rule out.
-sentinel=$(docker exec "disposeau-${NET}" sh -c 'cat /tmp/disposed-au 2>/dev/null' 2>/dev/null || true)
-[ "$sentinel" = "disposed" ] \
-  && ok "reset disposes an IDisposable root exactly once" \
-  || bad "reset disposes an IDisposable root exactly once (got: $sentinel)"
-
-echo "== a root resolved FROM the provider is not disposed a second time (review r1, finding 1) =="
-# Same fixture, but registered with the container via LIB_REGISTRAR instead
-# of left for ActivatorUtilities: the container itself tracks and disposes
-# it. HostedGraph must not ALSO call Dispose() on it -- doing so would rely
-# on the plugin's Dispose() being safe to call twice, which nothing
-# guarantees. If it ran twice, the sentinel would show two lines instead of
-# one.
-start_host disposeprov "${HERE}/publish/cslib" CsLib.dll CsLib.DisposableRoot \
-  '{"SentinelPath":"/tmp/disposed-prov"}' '{}' CsLib.DisposableRootStartup.Configure
-wait_healthy disposeprov && ok "a provider-owned disposable root constructs" \
-                         || bad "a provider-owned disposable root constructs"
-
-code=$(api disposeprov /instance -X DELETE -o /dev/null -w '%{http_code}')
-[ "$code" = "204" ] \
-  && ok "DELETE /instance returns 204 for a provider-owned disposable root" \
-  || bad "DELETE /instance returns 204 for a provider-owned disposable root (code=$code)"
-
-sentinel=$(docker exec "disposeprov-${NET}" sh -c 'cat /tmp/disposed-prov 2>/dev/null' 2>/dev/null || true)
-[ "$sentinel" = "disposed" ] \
-  && ok "a provider-owned root is disposed exactly once, not twice" \
-  || bad "a provider-owned root is disposed exactly once, not twice (got: $sentinel)"
-
-# The double-dispose this guards against would otherwise surface as the
-# container crashing on reset (an unhandled exception from a non-idempotent
-# Dispose()) -- assert the host is still serving, not just that /instance
-# returned 204 before any crash had a chance to happen.
-wait_healthy disposeprov && ok "the host survives a provider-owned root's reset" \
-                          || bad "the host survives a provider-owned root's reset"
-
-echo "== an INSTANCE-registered root is NOT disposed on reset -- deliberate (review r3) =="
-# services.AddSingleton<Root>(existingInstance) -- the ordinary LIB_REGISTRAR
-# shape. Round 2 made HostedGraph dispose this itself, by inspecting the
-# ServiceDescriptor that served the resolution. Round 3 deleted that scan: it
-# threw on a KEYED registration for the root's type and mis-computed
-# ownership for an open generic -- descriptor shapes are an open set no scan
-# can enumerate completely. The rule that replaced it is exactly .NET's own:
-# the provider disposes what it CREATED; fromProvider is not null covers
-# every shape the CONTAINER can build (type, factory, open generic, ...).
-# An instance registration is not one of those -- the container did not
-# create this object, so it is not tracked for disposal by .NET's own rules
-# either, and HostedGraph now (correctly) leaves it alone too.
-#
-# This is a DELIBERATE semantics change, not a regression: in any ordinary
-# ASP.NET Core app the container does not dispose an instance it did not
-# create -- the caller who built it owns its lifetime. Us disposing someone
-# else's object on DELETE /instance would be the surprising behaviour. The
-# cost is real: a root registered as an instance and holding an OS resource
-# is NOT released on reset. Register a type or a factory instead if reset
-# needs to release it.
-start_host disposeinst "${HERE}/publish/cslib" CsLib.dll CsLib.DisposableRoot '{}' '{}' \
-  CsLib.DisposableRootInstanceStartup.Configure
-wait_healthy disposeinst && ok "an instance-registered disposable root constructs" \
-                         || bad "an instance-registered disposable root constructs"
-
-# POSITIVE CONTROL for the negative assertion at the end of this block.
-# "$sentinel is empty" passes for every failure of the MEASUREMENT itself --
-# a wrong path, a renamed fixture, docker exec failing -- and unlike the
-# sibling disposeau block, nothing else here proves the sentinel mechanism
-# works for THIS fixture and THIS path. So write a value through the exact
-# path that assertion reads, read it back with the exact command it uses, and
-# require it to come back. Run BEFORE the reset, deliberately: afterwards it
-# would overwrite whatever the reset had written and mask the very regression
-# the negative assertion exists to catch.
-docker exec "disposeinst-${NET}" sh -c 'printf disposed > /tmp/disposed-instance' >/dev/null 2>&1 || true
-control=$(docker exec "disposeinst-${NET}" sh -c 'cat /tmp/disposed-instance 2>/dev/null' 2>/dev/null || true)
-[ "$control" = "disposed" ] \
-  && ok "the instance-root sentinel WOULD be visible if it were written" \
-  || bad "the instance-root sentinel WOULD be visible if it were written (got: ${control:-absent})"
-docker exec "disposeinst-${NET}" sh -c 'rm -f /tmp/disposed-instance' >/dev/null 2>&1 || true
-docker exec "disposeinst-${NET}" sh -c 'test ! -f /tmp/disposed-instance' \
-  && ok "the control left the sentinel absent again before the reset" \
-  || bad "the control left the sentinel absent again before the reset"
-
-code=$(api disposeinst /instance -X DELETE -o /dev/null -w '%{http_code}')
-[ "$code" = "204" ] \
-  && ok "DELETE /instance returns 204 for an instance-registered disposable root" \
-  || bad "DELETE /instance returns 204 for an instance-registered disposable root (code=$code)"
-
-sentinel=$(docker exec "disposeinst-${NET}" sh -c 'cat /tmp/disposed-instance 2>/dev/null' 2>/dev/null || true)
-[ -z "$sentinel" ] \
-  && ok "reset does NOT dispose an instance-registered root (caller owns it)" \
-  || bad "reset does NOT dispose an instance-registered root (caller owns it) (got: $sentinel)"
-
-echo "== a KEYED registration for the root's type does not crash construction (review r3, critical) =="
-# KeyedServiceStartup registers KeyedProbe BOTH unkeyed and keyed (unkeyed
-# first). provider.GetService(typeof(KeyedProbe)) (unkeyed) resolves the
-# unkeyed registration regardless of order, so this configuration works
-# today, and must keep working. The finding this guards is that the earlier
-# descriptor-scan approach to disposal ownership read
-# ServiceDescriptor.ImplementationInstance on whatever descriptor a plain
-# `LastOrDefault(d => d.ServiceType == rootType)` happened to match -- here,
-# the KEYED one, since it was registered second. On
-# Microsoft.Extensions.DependencyInjection.Abstractions 8.0.0 that property
-# THREW for a keyed descriptor (dotnet/runtime#95789); 9.0.0+ (what this
-# project's net10.0 / package 10.0.0 actually restores) fixed it to return
-# null instead, so this exact scan no longer crashes on THIS package
-# version -- verified directly, not assumed (see task-2-report.md). The
-# test stands regardless: it pins that a keyed registration for the root's
-# own type never affects construction, and the scan this guards against
-# is deleted, not merely lucky on the currently-restored package version.
-start_host keyedroot "${HERE}/publish/cslib" CsLib.dll CsLib.KeyedProbe '{}' '{}' \
-  CsLib.KeyedServiceStartup.Configure
-wait_healthy keyedroot \
-  && ok "a root type with an unrelated KEYED registration still constructs" \
-  || bad "a root type with an unrelated KEYED registration still constructs"
-
-body=$(api keyedroot /invoke -X POST -H 'Content-Type: application/json' \
-  -d '{"method":"Ping","args":[]}')
-[ "$body" = '{"ok":true,"result":"keyed-probe-alive"}' ] \
-  && ok "the root serves calls despite the keyed registration" \
-  || bad "the root serves calls despite the keyed registration (got: $body)"
-
-echo "== an OPEN-GENERIC root disposes exactly once (review r3) =="
-# GenericDisposableRoot<> is registered as an OPEN generic mapping -- no
-# descriptor's ServiceType equals the CLOSED root type LIB_TYPE names here,
-# which is what made the deleted descriptor-scan compute ownership as FALSE
-# and double-dispose it (once via HostedGraph's own explicit call, once via
-# the provider, which DOES track and dispose what it creates by closing an
-# open generic). fromProvider is not null covers this shape with no
-# inspection: the container created this instance, so the provider disposes
-# it, and HostedGraph correctly leaves it alone.
-#
-# LIB_TYPE names the CLOSED generic type via .NET's own reflection type-name
-# syntax (verified to round-trip through Assembly.GetType exactly as
-# PluginLoader.Load resolves it, via a standalone reflection check against
-# the built CsLib.dll -- not guessed).
-start_host opengen "${HERE}/publish/cslib" CsLib.dll \
-  'CsLib.GenericDisposableRoot`1[[CsLib.OpenGenericArg, CsLib, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]]' \
-  '{}' '{}' CsLib.OpenGenericStartup.Configure
-wait_healthy opengen && ok "an open-generic root constructs" \
-                     || bad "an open-generic root constructs"
-
-code=$(api opengen /instance -X DELETE -o /dev/null -w '%{http_code}')
-[ "$code" = "204" ] \
-  && ok "DELETE /instance returns 204 for an open-generic root" \
-  || bad "DELETE /instance returns 204 for an open-generic root (code=$code)"
-
-sentinel=$(docker exec "opengen-${NET}" sh -c 'cat /tmp/disposed-generic 2>/dev/null' 2>/dev/null || true)
-[ "$sentinel" = "disposed" ] \
-  && ok "an open-generic root is disposed exactly once, not twice" \
-  || bad "an open-generic root is disposed exactly once, not twice (got: $sentinel)"
-
-echo "== a root with no public constructor for a reason OTHER than being an interface still fails fast (review r1, finding 3) =="
-# Not start_host: --rm would remove the container before wait_stopped can
-# read its real exit code, same as every other fatal-startup case above.
-docker run -d --name "privctor-${NET}" --network "${NET}" --network-alias privctor \
-  -v "${HERE}/publish/cslib:/plugin:ro" \
-  -e LIB_DIR=/plugin -e LIB_ASSEMBLY=CsLib.dll -e LIB_TYPE=CsLib.PrivateCtorRoot -e LIB_OPTIONS='{}' \
-  "$IMAGE" >/dev/null 2>&1
-if code="$(wait_stopped "privctor-${NET}")" && [ "$code" -ne 0 ]; then
-  ok "a type with only a private constructor exits non-zero"
-else
-  docker logs "privctor-${NET}" 2>&1 | tail -4
-  bad "a type with only a private constructor exits non-zero"
-fi
-docker logs "privctor-${NET}" 2>&1 | grep -q "CsLib.PrivateCtorRoot" \
-  && ok "the failure names the type" \
-  || bad "the failure names the type"
-docker rm -f "privctor-${NET}" >/dev/null 2>&1 || true
-
-echo "== a registered root's construction goes through the container's OWN constructor selection (review r1, finding 2) =="
-# Registered via LIB_REGISTRAR, not left for ActivatorUtilities: the
-# container's own activation picks the constructor, and it does not honour
-# [ActivatorUtilitiesConstructor] -- that attribute is an ActivatorUtilities-
-# only convention the container's own resolver never looks at. Pinned here as
-# OBSERVED behaviour, not a requirement this host imposes: provider-first
-# means honouring the registration, activator semantics included, even where
-# they differ from ActivatorUtilities'.
-start_host multictor "${HERE}/publish/cslib" CsLib.dll CsLib.MultiCtorRoot '{}' '{}' \
-  CsLib.MultiCtorStartup.Configure
-wait_healthy multictor && ok "a root with multiple constructors, registered, constructs" \
-                       || bad "a root with multiple constructors, registered, constructs"
-body=$(api multictor /invoke -X POST -H 'Content-Type: application/json' \
-  -d '{"method":"WhichCtor","args":[]}')
-[ "$body" = '{"ok":true,"result":"two"}' ] \
-  && ok "the container's own constructor selection runs, not ActivatorUtilities'" \
-  || bad "the container's own constructor selection runs, not ActivatorUtilities' (got: $body)"
-
-echo "== composition-root mode: no LIB_TYPE =="
+echo "== the startup is the only way to say what to serve =="
 docker run -d --name "croot-${NET}" --network "${NET}" --network-alias croot \
   -v "${HERE}/publish/cslib:/plugin:ro" \
   -e LIB_DIR=/plugin -e LIB_ASSEMBLY=CsLib.dll \
   -e LIB_REGISTRAR=CsLib.GraphStartup.Configure \
   -e DOTNET_EnableDiagnostics=0 \
   "${IMAGE}" >/dev/null
-wait_healthy croot && ok "the host starts with no LIB_TYPE" \
-                  || bad "the host starts with no LIB_TYPE"
+wait_healthy croot && ok "the host starts from a registrar alone" \
+                  || bad "the host starts from a registrar alone"
 
 docker run --rm --network "${NET}" curlimages/curl:8.10.1 -s -m 10 \
   http://croot:8080/services | grep -q "CsLib.IRootFacade" \
   && ok "GET /services lists a registered service" \
   || bad "GET /services lists a registered service"
 
-echo "== neither LIB_TYPE nor LIB_REGISTRAR is fatal =="
+echo "== a missing LIB_REGISTRAR is fatal =="
 docker run -d --name "noconfig-${NET}" --network "${NET}" \
   -v "${HERE}/publish/cslib:/plugin:ro" \
   -e LIB_DIR=/plugin -e LIB_ASSEMBLY=CsLib.dll \
@@ -1086,11 +661,11 @@ docker run -d --name "noconfig-${NET}" --network "${NET}" \
   "${IMAGE}" >/dev/null
 if wait_stopped "noconfig-${NET}" \
    && [ "$(docker inspect -f '{{.State.ExitCode}}' "noconfig-${NET}")" != "0" ]; then
-  ok "a host with neither LIB_TYPE nor LIB_REGISTRAR exits non-zero"
+  ok "a host with no LIB_REGISTRAR exits non-zero"
 else
-  bad "a host with neither LIB_TYPE nor LIB_REGISTRAR exits non-zero"
+  bad "a host with no LIB_REGISTRAR exits non-zero"
 fi
-docker logs "noconfig-${NET}" 2>&1 | grep -q "LIB_TYPE" \
+docker logs "noconfig-${NET}" 2>&1 | grep -q "LIB_REGISTRAR" \
   && docker logs "noconfig-${NET}" 2>&1 | grep -q "LIB_REGISTRAR" \
   && ok "the failure names both variables" \
   || bad "the failure names both variables"
@@ -1098,7 +673,7 @@ docker rm -f "noconfig-${NET}" >/dev/null 2>&1 || true
 
 out=$(api croot /invoke -X POST -H 'Content-Type: application/json' \
   -d '{"method":"Who","args":[]}')
-echo "$out" | grep -qi "composition-root\|must name a service" \
+echo "$out" | grep -qi "must name the service" \
   && ok "an invoke with no service says so plainly" \
   || bad "an invoke with no service says so plainly"
 
@@ -1117,7 +692,7 @@ echo "== a service resolved via an EXPLICIT interface implementation is reachabl
   || bad "an explicitly-implemented interface method is still reachable by name"
 
 echo "== a service-routed call reaches members the interface INHERITS (review final, C1) =="
-# Same defect as the interface-LIB_TYPE case above, on the OTHER new v1.1
+# Same defect as the inherited-member case above, on the OTHER v1.1
 # path: /invoke's "service" field dispatches against the type Resolve found,
 # which is the interface. CallbackHost.cs already ruled that a member
 # inherited from a base interface IS part of the served contract; Invoker now
@@ -1214,7 +789,7 @@ echo "== a reset lands safely against calls already in flight =="
 # provider-owned singleton is disposed by ServiceProvider.Dispose(), which is
 # idempotent (measured: three calls, one disposal), so a double
 # HostedGraph.Dispose() reaches it exactly once either way. CsLib.DisposableRoot
-# named as LIB_TYPE and registered by nothing is built by ActivatorUtilities, so
+# resolved by name from the graph the startup built, so
 # HostedGraph disposes it EXPLICITLY -- and a second disposal appends a second
 # line. LIB_REGISTRAR still runs, so ICounter is here too.
 #
@@ -1231,10 +806,15 @@ echo "== a reset lands safely against calls already in flight =="
 # ReaderWriterLockSlim version, this case produced SynchronizationLockException
 # and then wedged every later call -- see task-5-report.md -- which is why
 # InstanceHolder holds no lock across the await.
-start_host inflight "${HERE}/publish/cslib" CsLib.dll CsLib.DisposableRoot \
-  '{"SentinelPath":"/tmp/disposed-inflight"}' '{}' CsLib.GraphStartup.Configure
+start_host inflight "${HERE}/publish/cslib" CsLib.dll CsLib.DisposableRootStartup.Configure \
+  '{}' '{}' /tmp /tmp/disposed-inflight
 wait_healthy inflight && ok "the in-flight host constructs" \
                       || bad "the in-flight host constructs"
+
+# Resolve it once so the singleton actually EXISTS. Without this the graph is
+# disposed with nothing in it and the sentinel stays empty -- the test would
+# then report "disposed 0 times" for a host that behaved perfectly.
+api_service inflight CsLib.DisposableRoot Ping >/dev/null
 
 count_disposed() { # RAW Dispose() entries -- one line appended per call
   docker exec "inflight-${NET}" sh -c \
@@ -1320,10 +900,12 @@ echo "== a plugin Dispose() that throws must not destroy an innocent caller's re
 # an empty HTTP 500 -- to a caller that did nothing but happen to be last, which
 # depends on scheduling, so the same plugin defect would destroy a different
 # arbitrary request every run.
-start_host disposethrow "${HERE}/publish/cslib" CsLib.dll CsLib.ThrowingDisposableRoot \
-  '{"SentinelPath":"/tmp/throwing-disposed"}' '{}' CsLib.GraphStartup.Configure
+start_host disposethrow "${HERE}/publish/cslib" CsLib.dll CsLib.ThrowingDisposableRootStartup.Configure \
+  '{}' '{}' /tmp /tmp/throwing-disposed
 wait_healthy disposethrow && ok "a root with a throwing Dispose() constructs" \
                           || bad "a root with a throwing Dispose() constructs"
+
+api_service disposethrow CsLib.ThrowingDisposableRoot Ping >/dev/null
 
 hold_c="$(mktemp)"; hold_d="$(mktemp)"
 api_service disposethrow CsLib.ICounter HoldThenNextAsync '["/tmp/go"]' >"$hold_c" 2>&1 &
@@ -1384,47 +966,18 @@ wait_healthy disposethrow && ok "the host still serves after a throwing Dispose(
 # asked for the reset is the right person to be told their plugin is broken --
 # unlike the bystander above, they are actually acting on this graph.
 docker exec "disposethrow-${NET}" rm -f /tmp/go >/dev/null 2>&1 || true
+
+# Resolve it on the REBUILT graph. The reset above replaced the provider, and
+# the replacement has never constructed its singleton -- a provider disposes
+# only what it created, so without this the second reset would dispose an empty
+# graph, return 204, and the test would read that as "the throw was swallowed"
+# when nothing had thrown at all.
+api_service disposethrow CsLib.ThrowingDisposableRoot Ping >/dev/null
+
 idle_code=$(api disposethrow /instance -X DELETE -m 20 -o /dev/null -w '%{http_code}' || true)
 [ "$idle_code" = "500" ] \
   && ok "with nothing in flight, a throwing Dispose() is reported to DELETE /instance" \
   || bad "with nothing in flight, a throwing Dispose() is reported to DELETE /instance (code=${idle_code:-none})"
-
-echo "== a throwing root still lets the provider dispose its singletons (review final, I1) =="
-# HostedGraph.Dispose() had no try/finally: the root's Dispose() threw and
-# provider.Dispose() never ran, so EVERY provider-owned singleton survived the
-# reset undisposed while the host went on reporting itself healthy. Each
-# further reset leaked another whole graph. The suite already shipped a
-# throwing-Dispose fixture and could not see this, because nothing GraphStartup
-# registers is IDisposable -- OwnedResource is the missing instrument.
-start_host ownedthrow "${HERE}/publish/cslib" CsLib.dll CsLib.ThrowingDisposableRoot \
-  '{"SentinelPath":"/tmp/throwing-owned"}' '{}' CsLib.ThrowingRootOwnedStartup.Configure
-wait_healthy ownedthrow && ok "a throwing root with an owned singleton constructs" \
-                        || bad "a throwing root with an owned singleton constructs"
-
-# Resolve OwnedResource so the provider actually CREATES and tracks it. The
-# provider only disposes what it created, so without this the assertion below
-# would pass against the bug.
-api_service ownedthrow CsLib.OwnedResource Ping >/dev/null
-
-owned_code=$(api ownedthrow /instance -X DELETE -m 20 -o /dev/null -w '%{http_code}' || true)
-[ "$owned_code" = "500" ] \
-  && ok "the throwing root is still reported to DELETE /instance" \
-  || bad "the throwing root is still reported to DELETE /instance (code=${owned_code:-none})"
-
-# Positive control for the case: the root's Dispose() really ran and really
-# threw. Without it, a graph that skipped disposal entirely would satisfy
-# nothing below and still look plausible.
-root_lines=$(docker exec "ownedthrow-${NET}" sh -c \
-  'wc -l < /tmp/throwing-owned 2>/dev/null || echo 0' 2>/dev/null | tr -d ' ')
-[ "$root_lines" = "1" ] \
-  && ok "the root's throwing Dispose() ran exactly once" \
-  || bad "the root's throwing Dispose() ran exactly once (lines: ${root_lines:-none})"
-
-owned_sentinel=$(docker exec "ownedthrow-${NET}" sh -c \
-  'cat /tmp/owned-disposed 2>/dev/null' 2>/dev/null || true)
-[ "$owned_sentinel" = "disposed" ] \
-  && ok "a provider-owned singleton is disposed even though the root's Dispose() threw" \
-  || bad "a provider-owned singleton is disposed even though the root's Dispose() threw (got: ${owned_sentinel:-absent})"
 
 echo "== an IAsyncDisposable-only singleton does not break DELETE /instance (review final, I2) =="
 # ServiceProvider.Dispose() (synchronous) THROWS for a tracked singleton that
@@ -1438,8 +991,7 @@ echo "== an IAsyncDisposable-only singleton does not break DELETE /instance (rev
 # one is reached FIRST and, under synchronous disposal, throws before
 # OwnedResource is ever reached -- which is why both sentinels being present
 # is evidence disposal ran to completion rather than merely started.
-start_host asyncdisp "${HERE}/publish/cslib" CsLib.dll '' '{}' '{}' \
-  CsLib.AsyncOnlyStartup.Configure
+start_host asyncdisp "${HERE}/publish/cslib" CsLib.dll CsLib.AsyncOnlyStartup.Configure
 wait_healthy asyncdisp && ok "a host with an IAsyncDisposable-only singleton starts" \
                       || bad "a host with an IAsyncDisposable-only singleton starts"
 
@@ -1466,26 +1018,6 @@ async_owned=$(docker exec "asyncdisp-${NET}" sh -c \
 [ "$async_owned" = "disposed" ] \
   && ok "disposal ran to completion, not just up to the async-only service" \
   || bad "disposal ran to completion, not just up to the async-only service (got: ${async_owned:-absent})"
-
-echo "== an IAsyncDisposable-ONLY root is disposed too =="
-# LIB_TYPE, registered by nothing, so ActivatorUtilities builds it and
-# HostedGraph is the only thing that can dispose it -- and it used to look for
-# IDisposable alone, so a root of this shape was disposed by nobody at all.
-start_host asyncroot "${HERE}/publish/cslib" CsLib.dll CsLib.AsyncOnlyRoot '{}' '{}'
-wait_healthy asyncroot && ok "an IAsyncDisposable-only root constructs" \
-                      || bad "an IAsyncDisposable-only root constructs"
-docker exec "asyncroot-${NET}" sh -c 'test ! -f /tmp/async-root-disposed' \
-  && ok "the async-only root is not disposed before DELETE /instance" \
-  || bad "the async-only root is not disposed before DELETE /instance"
-asyncroot_code=$(api asyncroot /instance -X DELETE -m 20 -o /dev/null -w '%{http_code}' || true)
-[ "$asyncroot_code" = "204" ] \
-  && ok "DELETE /instance returns 204 for an IAsyncDisposable-only root" \
-  || bad "DELETE /instance returns 204 for an IAsyncDisposable-only root (code=${asyncroot_code:-none})"
-asyncroot_sentinel=$(docker exec "asyncroot-${NET}" sh -c \
-  'cat /tmp/async-root-disposed 2>/dev/null' 2>/dev/null || true)
-[ "$asyncroot_sentinel" = "disposed" ] \
-  && ok "an IAsyncDisposable-only root is disposed exactly once on reset" \
-  || bad "an IAsyncDisposable-only root is disposed exactly once on reset (got: ${asyncroot_sentinel:-absent})"
 
 echo "== the typed client drives a composition root =="
 # Reuses the still-running croot host from "composition-root mode" above,
@@ -1554,9 +1086,9 @@ echo "== native assets =="
 # worked, a consumer had to compute the host image's RID themselves and pass
 # LD_LIBRARY_PATH into the container; nothing below sets it, so if these pass
 # the consumer genuinely needs no configuration.
-start_host nat "${HERE}/publish/nativelib" NativeLib.dll NativeLib.GitProbe '{}'
+start_host nat "${HERE}/publish/nativelib" NativeLib.dll NativeLib.NativeStartup.Configure
 if wait_healthy nat; then
-  NAT_OUT=$(api nat /invoke -X POST -H 'Content-Type: application/json' -d '{"method":"InitAndCommit","args":["/tmp/natrepo"]}')
+  NAT_OUT=$(api nat /invoke -X POST -H 'Content-Type: application/json' -d '{"service":"NativeLib.IGitProbe","method":"InitAndCommit","args":["/tmp/natrepo"]}')
   # A 40-char SHA, not merely ok:true. Producing one requires libgit2 to hash
   # and write real objects, so it cannot be faked by a managed code path.
   if echo "$NAT_OUT" | grep -qE '"result":"[0-9a-f]{40}"'; then
@@ -1587,10 +1119,11 @@ cp -r "${HERE}/publish/nativelib" "$STRIP"
 rm -rf "$STRIP/runtimes"
 docker run -d --rm --name "natstrip-${NET}" --network "${NET}" --network-alias natstrip \
   -v "$STRIP:/plugin:ro" \
-  -e LIB_DIR=/plugin -e LIB_ASSEMBLY=NativeLib.dll -e LIB_TYPE=NativeLib.GitProbe \
-  -e LIB_OPTIONS='{}' -e DOTNET_EnableDiagnostics=0 "$IMAGE" >/dev/null 2>&1
+  -e LIB_DIR=/plugin -e LIB_ASSEMBLY=NativeLib.dll \
+  -e LIB_REGISTRAR=NativeLib.NativeStartup.Configure \
+  -e DOTNET_EnableDiagnostics=0 "$IMAGE" >/dev/null 2>&1
 if wait_healthy natstrip; then
-  STRIP_OUT=$(api natstrip /invoke -X POST -H 'Content-Type: application/json' -d '{"method":"InitAndCommit","args":["/tmp/natrepo"]}')
+  STRIP_OUT=$(api natstrip /invoke -X POST -H 'Content-Type: application/json' -d '{"service":"NativeLib.IGitProbe","method":"InitAndCommit","args":["/tmp/natrepo"]}')
   echo "$STRIP_OUT" | grep -q '"ok":false' \
     && ok "with native assets removed the SAME call fails -- the case above is not vacuous" \
     || bad "with native assets removed the SAME call fails (got: $STRIP_OUT)"
@@ -1620,11 +1153,12 @@ rm -rf "$(dirname "$STRIP")"
 docker run -d --rm --name "natmgd-${NET}" --network "${NET}" --network-alias natmgd \
   --entrypoint dotnet \
   -v "${HERE}/publish/nativelib:/plugin:ro" \
-  -e LIB_DIR=/plugin -e LIB_ASSEMBLY=NativeLib.dll -e LIB_TYPE=NativeLib.GitProbe \
-  -e LIB_OPTIONS='{}' -e DOTNET_EnableDiagnostics=0 "$IMAGE" \
+  -e LIB_DIR=/plugin -e LIB_ASSEMBLY=NativeLib.dll \
+  -e LIB_REGISTRAR=NativeLib.NativeStartup.Configure \
+  -e DOTNET_EnableDiagnostics=0 "$IMAGE" \
   /app/RemoteFacadeHost.dll >/dev/null 2>&1
 if wait_healthy natmgd; then
-  MGD_OUT=$(api natmgd /invoke -X POST -H 'Content-Type: application/json' -d '{"method":"InitAndCommit","args":["/tmp/natrepo"]}')
+  MGD_OUT=$(api natmgd /invoke -X POST -H 'Content-Type: application/json' -d '{"service":"NativeLib.IGitProbe","method":"InitAndCommit","args":["/tmp/natrepo"]}')
   echo "$MGD_OUT" | grep -qE '"result":"[0-9a-f]{40}"' \
     && ok "the managed resolver alone resolves native assets, with no LD_LIBRARY_PATH" \
     || bad "the managed resolver alone resolves native assets (got: $MGD_OUT)"
@@ -1635,9 +1169,9 @@ docker rm -f "natmgd-${NET}" >/dev/null 2>&1 || true
 
 echo "== wire-format baseline vs the previous release =="
 if sh "${HERE}/baseline.sh" "${IMAGE}"; then
-  ok "responses are byte-identical to v1.0.1 for a v1.0 configuration"
+  ok "responses are byte-identical to v2.1.0 for a composition configuration"
 else
-  bad "responses DIFFER from v1.0.1 for a v1.0 configuration"
+  bad "responses DIFFER from v2.1.0 for a composition configuration"
 fi
 
 echo

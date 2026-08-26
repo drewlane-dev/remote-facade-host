@@ -1,6 +1,6 @@
 #!/bin/sh
 # Compares /invoke responses from the image under test against the PUBLISHED
-# v1.0.1 image, byte for byte, for a v1.0-shaped configuration.
+# v2.1.0 image, byte for byte, for a composition-root configuration.
 #
 # This exists because a wire-format change is invisible to ordinary tests: a
 # regression that drops a field still returns ok:true and still passes any
@@ -9,11 +9,17 @@
 set -eu
 
 IMAGE="${1:-remote-facade-host:dev}"
-# Deliberately the OLD image name. v1.0.1 was published as remote-class-host,
-# before the rename, and that is the artifact whose wire format this guard pins.
-# Rewriting it to the new name would point at a tag that has never existed, and
-# the guard would fail to pull rather than compare anything.
-BASELINE="ghcr.io/drewlane-dev/remote-class-host:1.0.1"
+# Re-baselined for v3. The previous baseline was remote-class-host:1.0.1 driven
+# through a LIB_TYPE configuration -- which v3 removed, so that comparison can
+# no longer be run at all: the old image cannot speak the new configuration and
+# the new image cannot speak the old one.
+#
+# v2.1.0 is the last release that supports BOTH, so it is the only artifact
+# against which a composition-root configuration can be compared across the
+# break. Everything below is service-routed, which is exactly the surface v3
+# keeps, so any drift in it is a real regression rather than the intended
+# removal.
+BASELINE="ghcr.io/drewlane-dev/remote-facade-host:2.1.0"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 NET="rch-baseline-$$"
 PASS=0
@@ -30,14 +36,13 @@ trap cleanup EXIT
 docker network create "${NET}" >/dev/null
 
 start() { # start <name> <image>
-  # LIB_SERVICES is REQUIRED here: CsLib.Store's constructor takes IStamp, so
-  # without a mapping the container fails to construct and never becomes
-  # healthy. This mirrors exactly how test/run.sh starts its own `cs` host.
+  # GraphStartup registers the whole spread this compares over: a plain
+  # facade, an inherited interface member, a counter, and a Scoped
+  # registration whose rejection is itself part of the wire format.
   docker run -d --name "$1" --network "${NET}" --network-alias "$1" \
     -v "${HERE}/publish/cslib:/plugin:ro" \
-    -e LIB_DIR=/plugin -e LIB_ASSEMBLY=CsLib.dll -e LIB_TYPE=CsLib.Store \
-    -e LIB_OPTIONS='{"RootPath":"/tmp/baseline"}' \
-    -e LIB_SERVICES='{"CsLib.IStamp":"CsLib.RealStamp"}' \
+    -e LIB_DIR=/plugin -e LIB_ASSEMBLY=CsLib.dll \
+    -e LIB_REGISTRAR=CsLib.GraphStartup.Configure \
     -e DOTNET_EnableDiagnostics=0 \
     "$2" >/dev/null
 }
@@ -67,20 +72,21 @@ wait_healthy "base-${NET}" || { echo "baseline image did not become healthy"; ex
 wait_healthy "test-${NET}" || { echo "image under test did not become healthy"; exit 1; }
 
 # Each case is a full /invoke body. Compare the WHOLE response envelope: a
-# substring check would pass against a payload that had lost a field.
-# Method names verified against test/fixtures/CsLib/Store.cs. Two of these --
-# VtValueAsync and PolyReturn -- are the exact shapes that regressed in the last
-# release cycle, so they are the ones most worth pinning byte-for-byte.
+# substring check would pass against a payload that had lost a field. Service
+# names and methods verified against test/fixtures/CsLib/Store.cs.
+#
+# The error shapes matter as much as the successes: three of these pin
+# rejections (no such method, unknown service, Scoped), and those messages are
+# what a consumer actually reads when something is wrong.
 for body in \
-  '{"method":"WriteAsync","args":["a.txt","hello"]}' \
-  '{"method":"ReadAsync","args":["a.txt"]}' \
-  '{"method":"Count","args":[]}' \
-  '{"method":"VtValueAsync","args":[]}' \
-  '{"method":"Stamp","args":[]}' \
-  '{"method":"RefArg","args":[1]}' \
-  '{"method":"Echo","args":[1]}' \
-  '{"method":"PolyReturn","args":[]}' \
-  '{"method":"DefinitelyMissing","args":[]}' \
+  '{"service":"CsLib.IRootFacade","method":"Who","args":[]}' \
+  '{"service":"CsLib.IDerivedFacade","method":"FromBase","args":[]}' \
+  '{"service":"CsLib.IDerivedFacade","method":"FromDerived","args":[]}' \
+  '{"service":"CsLib.IExplicitThing","method":"Go","args":[]}' \
+  '{"service":"CsLib.ICounter","method":"Next","args":[]}' \
+  '{"service":"CsLib.IScopedThing","method":"Say","args":[]}' \
+  '{"service":"CsLib.IRootFacade","method":"DefinitelyMissing","args":[]}' \
+  '{"service":"CsLib.NoSuchService","method":"Who","args":[]}' \
   ; do
   a=$(call "base-${NET}" "$body")
   b=$(call "test-${NET}" "$body")

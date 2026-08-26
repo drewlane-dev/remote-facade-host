@@ -92,7 +92,7 @@ public static class ShareMounter
 
         // `mount` can exit 0 without the kernel actually attaching anything at
         // mountPoint in some failure modes, and SMB_MOUNT_POINT drifting apart
-        // from where the library actually reads/writes (e.g. LIB_OPTIONS'
+        // from where the library actually reads/writes (e.g. the path the startup's
         // RootPath) would otherwise go unnoticed — the host would serve from
         // an ordinary, empty, local directory instead of the share. Checking
         // /proc/mounts confirms the attach really happened at the path we

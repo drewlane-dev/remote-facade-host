@@ -60,7 +60,8 @@ catch (Exception ex)
 
 callbacks.Serve<IStamp>(mock.Object);
 
-var store = RemoteFacade.For<IStore>("http://cb:8080");
+await using var cbHost = RemoteHost.At("http://cb:8080");
+var store = await cbHost.GetAsync<IStore>();
 
 Console.WriteLine("RESULT: stamp " + store.Stamp());
 Console.WriteLine("RESULT: count " + await store.StampCountAsync());
@@ -126,7 +127,7 @@ using var invoker = new HttpClient();
 async Task<string> InvokeRaw(string methodName)
 {
     var response = await invoker.PostAsync("http://cb:8080/invoke",
-        new StringContent($$"""{"method":"{{methodName}}","args":[]}""",
+        new StringContent($$"""{"service":"CsLib.Store","method":"{{methodName}}","args":[]}""",
             Encoding.UTF8, "application/json"));
 
     return (await response.Content.ReadAsStringAsync()).Replace("\n", " ").Replace("\r", " ");

@@ -21,6 +21,15 @@ public class RemoteFacadeTests
         Task<Widget> Complex();
     }
 
+    /// <summary>
+    /// The only way to build a proxy now. ForService is internal, reached via
+    /// InternalsVisibleTo, because RemoteHost is the public entry point and it
+    /// is what supplies the HttpClient and the service name in real use.
+    /// </summary>
+    private static IProbe Probe(StubHost stub, string service = "CsLib.IProbe") =>
+        RemoteFacadeHost.Client.RemoteFacade.ForService<IProbe>(
+            new HttpClient { BaseAddress = new Uri(stub.Url) }, service);
+
     public sealed class Widget
     {
         public string Name { get; set; } = "";
@@ -28,46 +37,33 @@ public class RemoteFacadeTests
     }
 
     [Fact]
-    public async Task For_T_does_NOT_put_a_service_field_on_the_wire()
+    public async Task Every_call_names_its_service_on_the_wire()
     {
-        // Load-bearing. test/baseline.sh compares /invoke bodies byte-for-byte
-        // against the previous release, and a service field present-but-null
-        // would break that for every v1.0-shaped call.
+        // v3 removed the un-named form along with single-class hosting, and
+        // the host now rejects a call without a service. This is the shape
+        // test/baseline.sh pins byte-for-byte against v2.1.0.
         await using var stub = await StubHost.Serving("""{"ok":true,"result":"x"}""");
 
-        await RemoteFacadeHost.Client.RemoteFacade.For<IProbe>(stub.Url).TaskOfT("hi");
-
-        var body = stub.Bodies.Single();
-        Assert.DoesNotContain("service", body);
-        using var json = JsonDocument.Parse(body);
-        Assert.Equal("TaskOfT", json.RootElement.GetProperty("method").GetString());
-        Assert.Equal("hi", json.RootElement.GetProperty("args")[0].GetString());
-    }
-
-    [Fact]
-    public async Task ForService_DOES_name_the_service_on_every_call()
-    {
-        await using var stub = await StubHost.Serving("""{"ok":true,"result":"x"}""");
-        using var http = new HttpClient { BaseAddress = new Uri(stub.Url) };
-
-        await RemoteFacadeHost.Client.RemoteFacade.ForService<IProbe>(http, "Some.IThing").TaskOfT("hi");
+        await Probe(stub, "Some.IThing").TaskOfT("hi");
 
         using var json = JsonDocument.Parse(stub.Bodies.Single());
         Assert.Equal("Some.IThing", json.RootElement.GetProperty("service").GetString());
+        Assert.Equal("TaskOfT", json.RootElement.GetProperty("method").GetString());
+        Assert.Equal("hi", json.RootElement.GetProperty("args")[0].GetString());
     }
 
     [Fact]
     public async Task A_Task_of_T_carries_the_deserialized_value()
     {
         await using var stub = await StubHost.Serving("""{"ok":true,"result":"pong"}""");
-        Assert.Equal("pong", await RemoteFacadeHost.Client.RemoteFacade.For<IProbe>(stub.Url).TaskOfT("ping"));
+        Assert.Equal("pong", await Probe(stub).TaskOfT("ping"));
     }
 
     [Fact]
     public async Task A_ValueTask_of_T_carries_the_deserialized_value()
     {
         await using var stub = await StubHost.Serving("""{"ok":true,"result":11}""");
-        Assert.Equal(11, await RemoteFacadeHost.Client.RemoteFacade.For<IProbe>(stub.Url).ValueTaskOfT());
+        Assert.Equal(11, await Probe(stub).ValueTaskOfT());
     }
 
     [Fact]
@@ -77,7 +73,7 @@ public class RemoteFacadeTests
         // not require the interface's PascalCase to match.
         await using var stub = await StubHost.Serving("""{"ok":true,"result":{"name":"w","count":3}}""");
 
-        var widget = await RemoteFacadeHost.Client.RemoteFacade.For<IProbe>(stub.Url).Complex();
+        var widget = await Probe(stub).Complex();
 
         Assert.Equal("w", widget.Name);
         Assert.Equal(3, widget.Count);
@@ -92,7 +88,7 @@ public class RemoteFacadeTests
         // The envelope deliberately has no "result" at all. Reading one would
         // throw, so this pins that the client does not.
         await using var stub = await StubHost.Serving("""{"ok":true}""");
-        var probe = RemoteFacadeHost.Client.RemoteFacade.For<IProbe>(stub.Url);
+        var probe = Probe(stub);
 
         switch (method)
         {
@@ -108,7 +104,7 @@ public class RemoteFacadeTests
     public async Task A_synchronous_method_blocks_and_returns_the_value()
     {
         await using var stub = await StubHost.Serving("""{"ok":true,"result":"now"}""");
-        Assert.Equal("now", RemoteFacadeHost.Client.RemoteFacade.For<IProbe>(stub.Url).Sync());
+        Assert.Equal("now", Probe(stub).Sync());
     }
 
     [Fact]
@@ -117,7 +113,7 @@ public class RemoteFacadeTests
         await using var stub = await StubHost.Serving("""{"ok":false,"error":"plugin said no"}""");
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => RemoteFacadeHost.Client.RemoteFacade.For<IProbe>(stub.Url).TaskOfT("x"));
+            () => Probe(stub).TaskOfT("x"));
 
         Assert.Equal("plugin said no", ex.Message);
     }
@@ -131,7 +127,7 @@ public class RemoteFacadeTests
         await using var stub = await StubHost.Serving(_ => (502, "<html>bad gateway</html>"));
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => RemoteFacadeHost.Client.RemoteFacade.For<IProbe>(stub.Url).TaskOfT("x"));
+            () => Probe(stub).TaskOfT("x"));
 
         Assert.Contains("502", ex.Message);
         Assert.Contains("TaskOfT", ex.Message);
@@ -152,7 +148,7 @@ public class RemoteFacadeTests
             return (200, """{"ok":true,"result":"done"}""");
         });
 
-        var pending = RemoteFacadeHost.Client.RemoteFacade.For<IProbe>(stub.Url).TaskOfT("x");
+        var pending = Probe(stub).TaskOfT("x");
 
         Assert.False(pending.IsCompleted);
         release.SetResult();

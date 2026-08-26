@@ -2,6 +2,7 @@ Imports System.IO
 Imports System.Threading.Tasks
 Imports Microsoft.Extensions.Logging
 Imports Microsoft.Extensions.Options
+Imports Microsoft.Extensions.DependencyInjection
 
 Namespace VbLib
 
@@ -37,5 +38,25 @@ Namespace VbLib
         End Function
 
     End Class
+
+    ''' <summary>
+    ''' The VB startup. v3 removed LIB_TYPE, so a VB library is hosted exactly
+    ''' as a C# one is: by naming a static registration method in LIB_REGISTRAR.
+    '''
+    ''' A Module is the VB shape for this. Its members are implicitly Shared, so
+    ''' reflection sees Configure as the static method the host requires -- no
+    ''' Shared keyword needed, and adding one is a compile error.
+    ''' </summary>
+    Public Module VbStartup
+
+        Public Sub Configure(services As IServiceCollection)
+            Dim root = Environment.GetEnvironmentVariable("STORE_ROOT")
+            If String.IsNullOrEmpty(root) Then root = "/tmp"
+
+            services.Configure(Of VbOptions)(Sub(o) o.RootPath = root)
+            services.AddSingleton(Of IVbStore, VbStore)()
+        End Sub
+
+    End Module
 
 End Namespace

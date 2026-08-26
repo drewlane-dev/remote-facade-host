@@ -5,21 +5,45 @@ using RemoteFacadeHost;
 var dir      = Environment.GetEnvironmentVariable("LIB_DIR") ?? "/plugin";
 var asmFile  = Environment.GetEnvironmentVariable("LIB_ASSEMBLY")
                ?? throw new InvalidOperationException("LIB_ASSEMBLY is required");
-var typeName = Environment.GetEnvironmentVariable("LIB_TYPE");
-var optsJson = Environment.GetEnvironmentVariable("LIB_OPTIONS") ?? "{}";
 var servicesJson = Environment.GetEnvironmentVariable("LIB_SERVICES") ?? "{}";
 var registrar = Environment.GetEnvironmentVariable("LIB_REGISTRAR");
 var callbacksJson = Environment.GetEnvironmentVariable("LIB_CALLBACKS") ?? "{}";
 var port     = Environment.GetEnvironmentVariable("LIB_PORT") ?? "8080";
 
-// One of the two must say what to serve. Without either, the container would
-// start and answer nothing, and the first call would fail with something that
-// does not name the actual mistake.
-if (string.IsNullOrWhiteSpace(typeName) && string.IsNullOrWhiteSpace(registrar))
+// The startup is the only way to say what to serve. Without it the container
+// would start and answer nothing, and the first call would fail with something
+// that does not name the actual mistake.
+if (string.IsNullOrWhiteSpace(registrar))
 {
     throw new InvalidOperationException(
-        "either LIB_TYPE (to host one class) or LIB_REGISTRAR (to host a " +
-        "composition root) is required; neither was set.");
+        "LIB_REGISTRAR is required: name the static registration method that " +
+        "builds your service graph, as 'Namespace.TypeName.MethodName'.");
+}
+
+// v2 also accepted LIB_TYPE (host one class, constructed by this host) and
+// LIB_OPTIONS (JSON bound onto that class's IOptions<T> parameters). Both were
+// removed in v3. Failing here rather than ignoring them is the point: a config
+// carried forward unchanged would otherwise start cleanly and serve a graph
+// that silently did not include what the operator asked for.
+// "{}" does not count as set. It was LIB_OPTIONS's own default in v2, so
+// every harness and compose file in existence passes it as inert filler --
+// refusing it would reject configurations that ask for nothing at all, which
+// is the same over-strict guard this codebase already got wrong once and
+// documented ("Only non-empty LIB_OPTIONS is fatal"). A value that actually
+// carries configuration still fails, because that configuration would
+// otherwise be silently dropped.
+foreach (var gone in (string[])["LIB_TYPE", "LIB_OPTIONS"])
+{
+    var value = Environment.GetEnvironmentVariable(gone)?.Trim();
+
+    if (!string.IsNullOrEmpty(value) && value != "{}")
+    {
+        throw new InvalidOperationException(
+            $"{gone} was removed in v3 and is no longer read, but is set to " +
+            $"'{value}'. Move this configuration into the startup named by " +
+            "LIB_REGISTRAR, which registers services and configures their " +
+            "options in ordinary C#.");
+    }
 }
 
 // Before constructing anything: the library may open paths on the share in its
@@ -31,20 +55,14 @@ ShareMounter.MountIfConfigured();
 // first load fails with nothing to catch it.
 NativeResolver.Install(dir);
 
-// Fail before serving. A host that starts without a usable instance would make
+// Fail before serving. A host that starts without a usable graph would make
 // every test using it fail confusingly at first call instead of at startup.
-var type = string.IsNullOrWhiteSpace(typeName)
-    ? null
-    : PluginLoader.Load(dir, asmFile, typeName);
+PluginLoader.LoadAssembly(dir, asmFile);
 
-// In composition-root mode nothing names a type, so the assembly still has to
-// be loaded for the registrar and for service-name lookup.
-if (type is null) PluginLoader.LoadAssembly(dir, asmFile);
-
-// One instance serves every call for the container's lifetime; that is what
+// One graph serves every call for the container's lifetime; that is what
 // allows a method to acquire a resource and a later call to release it.
 // InstanceHolder owns it so DELETE /instance can reset it between tests.
-var holder = new InstanceHolder(() => Activation.Build(type, optsJson, servicesJson, registrar, callbacksJson));
+var holder = new InstanceHolder(() => Activation.Build(registrar, servicesJson, callbacksJson));
 
 var builder = WebApplication.CreateBuilder(args);
 builder.WebHost.UseUrls($"http://0.0.0.0:{port}");
@@ -58,7 +76,7 @@ var app = builder.Build();
 // independently-constructed instance that could drift from this one.
 var jsonOptions = app.Services.GetRequiredService<IOptions<JsonOptions>>().Value.SerializerOptions;
 
-app.MapGet("/health", () => Results.Ok(new { type = type?.FullName }));
+app.MapGet("/health", () => Results.Ok(new { registrar }));
 app.MapGet("/types", () => Results.Ok(PluginLoader.TypeNames()));
 
 app.MapGet("/services", () => Results.Ok(holder.Use(graph => graph.ServiceNames)));
@@ -80,7 +98,17 @@ app.MapPost("/invoke", async (InvokeRequest request) =>
     // graph.
     return await holder.UseAsync<IResult>(async graph =>
     {
-        if (!string.IsNullOrWhiteSpace(request.Service))
+        if (string.IsNullOrWhiteSpace(request.Service))
+        {
+            return Results.Ok(new
+            {
+                ok = false,
+                error = "every call must name the service it wants in the " +
+                        "\"service\" field. v2's un-named calls went to the single " +
+                        "LIB_TYPE instance, which no longer exists.",
+            });
+        }
+
         {
             (object Instance, Type Type) resolved;
             try
@@ -143,18 +171,6 @@ app.MapPost("/invoke", async (InvokeRequest request) =>
             return Results.Ok(
                 await Invoker.InvokeAsync(resolved.Instance, resolved.Type, request, jsonOptions));
         }
-
-        if (graph.Root is null)
-        {
-            return Results.Ok(new
-            {
-                ok = false,
-                error = "this host is in composition-root mode (no LIB_TYPE), so a " +
-                        "call must name the service it wants in the \"service\" field.",
-            });
-        }
-
-        return Results.Ok(await Invoker.InvokeAsync(graph.Root, type!, request, jsonOptions));
     });
 });
 

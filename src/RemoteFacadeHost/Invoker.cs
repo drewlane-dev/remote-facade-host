@@ -29,7 +29,7 @@ public static class Invoker
         // an INTERFACE -- it returns only what that interface itself declares.
         // v1.0 always dispatched against the concrete class, so this never
         // mattered; both of v1.1's paths (a "service"-routed call, and
-        // LIB_TYPE naming an interface) dispatch against the interface, so for
+        // a service name naming an interface) dispatch against the interface, so for
         // IDerived : IBase, FromBase() was unreachable while FromDerived()
         // worked. Measured: {"ok":false,"error":"no method 'FromBase' taking 0
         // argument(s)"} against a live container.

@@ -3,7 +3,11 @@ using RemoteFacadeHost.Client;
 
 // The "test process". It references CsLib only for IStore; the real Store runs
 // in the container.
-IStore store = RemoteFacade.For<IStore>("http://cs:8080");
+// v3: RemoteHost is the only entry point. Store is registered under both
+// CsLib.Store and CsLib.IStore (one instance), and this asks for the concrete
+// name so the members IStore does not declare stay reachable.
+await using var csHost = RemoteHost.At("http://cs:8080");
+var store = await csHost.GetAsync<IStore>();
 
 await store.WriteAsync("a.txt", "hello");
 Console.WriteLine("RESULT: async-void ok");
@@ -43,10 +47,16 @@ Console.WriteLine("RESULT: vt-value " + await store.VtValueAsync());
 // from a real listener: no stub server needed, and the failure arrives by
 // exactly the route a mistyped base URL would take.
 await using var wrongEndpoint = CallbackHost.Start(9099);
-var misdirected = RemoteFacade.For<IStore>("http://127.0.0.1:9099");
+await using var wrongHost = RemoteHost.At("http://127.0.0.1:9099");
 
 try
 {
+    // v3 moves this guard EARLIER. With For<T> gone, the first thing a client
+    // says to a host is GET /services, so a mistyped base URL is caught while
+    // acquiring the proxy rather than on the first call. The /invoke leg of
+    // the same guard still exists and is covered by the unit suite, which can
+    // serve a 502 directly instead of needing a wrong listener.
+    var misdirected = await wrongHost.GetAsync<IStore>();
     misdirected.Count();
     Console.WriteLine("RESULT: status-guard NONE-THROWN");
 }

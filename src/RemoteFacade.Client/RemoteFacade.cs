@@ -4,20 +4,22 @@ using System.Text.Json;
 
 // The namespace deliberately does NOT begin with "RemoteFacade".
 //
-// A namespace segment wins name resolution over a type, so if this lived in
-// `namespace RemoteFacade.Client`, then `RemoteFacade.For<IStore>(url)` would
-// bind the NAMESPACE and never reach this class -- callers would be forced to
-// write `RemoteFacade.RemoteFacade.For<T>()`. That exact defect shipped once
-// under the old name (namespace RemoteClass containing class RemoteClass) and
-// was reintroduced during the rename to this one. Twice is enough: if you
-// change either name, check that `RemoteFacade.For<T>()` still compiles from a
-// consumer project, because the suite's own fixtures are the only thing that
-// catches it.
+// A namespace segment wins name resolution over a type, so a type named
+// RemoteFacade inside `namespace RemoteFacade.Client` is unreachable by its
+// own short name -- callers get the namespace instead. That defect shipped
+// once under the old name (namespace RemoteClass containing class RemoteClass)
+// and was reintroduced during the rename to this one.
+//
+// It no longer bites consumers, because v3 made this class internal and
+// RemoteHost is the only entry point, but the trap is still here for anyone
+// renaming things: keep the namespace root and any public type name distinct.
 
 namespace RemoteFacadeHost.Client;
 
 /// <summary>
-/// A typed client for a class hosted in a remote-facade-host container.
+/// The proxy that turns interface calls into HTTP. Internal: v3 removed the
+/// public For&lt;T&gt;(url) entry point along with single-class hosting, and
+/// <see cref="RemoteHost"/> is now the only way in.
 ///
 /// No code generation: your test project already references the library for its
 /// interface, so DispatchProxy can implement that interface and forward every
@@ -31,7 +33,7 @@ namespace RemoteFacadeHost.Client;
 /// concurrently against shared state. A blocking proxy would quietly turn every
 /// contention test into a sequential one that passes while proving nothing.
 /// </summary>
-public class RemoteFacade : DispatchProxy
+internal class RemoteFacade : DispatchProxy
 {
     // Bound once. MakeGenericMethod below needs the OPEN definitions, and
     // looking a private static up by name on every call would be wasteful.
@@ -43,21 +45,10 @@ public class RemoteFacade : DispatchProxy
 
     private HttpClient _http = null!;
     private string _interfaceName = null!;
-    private string? _service;
-
-    public static T For<T>(string baseUrl)
-    {
-        var proxy = Create<T, RemoteFacade>()!;
-        var self = (RemoteFacade)(object)proxy;
-        self._http = new HttpClient { BaseAddress = new Uri(baseUrl) };
-        // Kept so a transport-level failure can name WHICH interface was being
-        // called, the same way CallbackProxy names it in the other direction.
-        self._interfaceName = typeof(T).FullName!;
-        return proxy;
-    }
+    private string _service = null!;
 
     /// <summary>
-    /// A proxy that names the service on every call. Used by RemoteHost.
+    /// A proxy that names the service on every call.
     ///
     /// The name, not a handle to a resolved instance: the host resolves afresh
     /// per call, which is what lets ResetAsync rebuild the graph without
@@ -121,12 +112,10 @@ public class RemoteFacade : DispatchProxy
     /// </summary>
     private async Task<object?> CallAsync(MethodInfo method, object?[]? args, Type? resultType)
     {
-        // service is added to the payload ONLY when set: a service field
-        // present-but-null must never be sent for RemoteFacade.For<T>, whose
-        // wire format is pinned byte-for-byte against the v1.0 baseline.
-        var body = _service is null
-            ? JsonSerializer.Serialize(new { method = method.Name, args = args ?? [] })
-            : JsonSerializer.Serialize(new { method = method.Name, args = args ?? [], service = _service });
+        // Every call names its service: v3 removed the un-named form along with
+        // single-class hosting, and the host now rejects a call without one.
+        var body = JsonSerializer.Serialize(
+            new { method = method.Name, args = args ?? [], service = _service });
 
         var response = await _http.PostAsync("/invoke",
             new StringContent(body, Encoding.UTF8, "application/json")).ConfigureAwait(false);

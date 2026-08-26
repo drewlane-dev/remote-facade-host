@@ -62,7 +62,6 @@ public sealed class HostFixture : IAsyncLifetime
             // fail at container start, and deriving it means the compiler
             // catches a rename.
             .WithEnvironment(new Dictionary<string, string>(RemoteHostEnvironment.For(typeof(CsLib.GraphStartup))))
-            .WithEnvironment("LIB_OPTIONS", "{}")
             .WithEnvironment("DOTNET_EnableDiagnostics", "0")
             .WithPortBinding(8080, true)
             // /health, not just an open port: the host binds before the graph

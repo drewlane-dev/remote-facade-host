@@ -10,7 +10,17 @@ One image serves every plugin. Nothing library-specific is baked in: you
 mount a `dotnet publish` output directory, tell the host what to construct,
 and it starts answering calls.
 
-There are two ways to tell it that.
+You do that with a **startup**: a static method taking an `IServiceCollection`,
+written in your own code, that registers everything the container should serve.
+
+> **v3 is a breaking change.** The single-class mode (`LIB_TYPE`) and its
+> options binding (`LIB_OPTIONS`) were removed, along with the client's
+> `RemoteFacade.For<T>(url)`. A startup is now the only way to host, and
+> `RemoteHost.At(url).GetAsync<T>()` the only way to call. Configuration that
+> used to go in `LIB_OPTIONS` belongs in the startup, which is C# and can read
+> environment variables, files, or anything else, with the real types rather
+> than through a JSON binder the host owns. Setting either removed variable to
+> a meaningful value is a fatal startup error rather than silently ignored.
 
 ## How it works
 
@@ -34,7 +44,7 @@ flowchart LR
     end
 
     out -- "bind mount" --> mnt
-    env["LIB_ASSEMBLY / LIB_REGISTRAR<br/>LIB_OPTIONS / LIB_SERVICES"] -- "env vars" --> load
+    env["LIB_ASSEMBLY / LIB_REGISTRAR<br/>LIB_SERVICES / LIB_CALLBACKS"] -- "env vars" --> load
 
     inst -.-> shared[("shared state<br/>SMB share, SQL, ...")]
 ```
@@ -73,25 +83,6 @@ The callback arrow is the reverse direction: a dependency you name in
 `LIB_CALLBACKS` is proxied *back* to your test process, so a mock stays where
 your assertions are instead of being stranded inside the container.
 
-## Two ways to host
-
-**Composition-root hosting** points the container at your application's own
-DI startup — the same `IServiceCollection` wiring your app already has — and
-lets a test resolve whatever service it needs by interface. Choose this when
-the wiring is non-trivial (more than a couple of constructor dependencies,
-factories, real lifetimes) or when a test needs more than one surface out of
-the same container.
-
-**Single-instance hosting** constructs one class directly from `LIB_TYPE` and
-`LIB_OPTIONS`. Choose this for one simple class with simple configuration —
-it's less to set up when a composition root would be overkill.
-
-Both modes share the same wire protocol, the same pass-by-value boundary, and
-the same `DELETE /instance` reset. Composition-root hosting is the primary
-path; read that section first even if a single instance is all you need
-today; the pieces that come up in it (the boundary, `GET /services`, reset
-semantics) apply to both.
-
 ## Composition-root hosting
 
 Point the container at a static method that wires an `IServiceCollection`
@@ -112,7 +103,7 @@ public static class GraphStartup
 ```
 
 Two environment variables point the container at it — and that's all it
-needs; **`LIB_OPTIONS` is not consulted in this mode**, because there's no
+needs; configuration is the startup's own business, because there's no
 single root type to derive an `IOptions<T>` constructor parameter from. Bind
 whatever options your own startup needs the same way your app already does
 (`services.Configure<T>(...)`, `Options.Create(...)`, etc.), inside
@@ -126,8 +117,8 @@ docker run \
   ... remote-facade-host
 ```
 
-Leaving `LIB_TYPE` unset is what selects this mode — the host requires
-*either* `LIB_TYPE` *or* `LIB_REGISTRAR`, never neither. From the test
+`LIB_REGISTRAR` is required: it is the only way to say what a container
+serves. From the test
 process, use `RemoteHost` (from the `RemoteFacade.Client` package) to resolve
 services by interface:
 
@@ -343,83 +334,6 @@ own container resolves it — not "any matching descriptor is Scoped." A
 singleton registered after a scoped one for the same interface is served
 normally.
 
-## Single-instance hosting (the quick path)
-
-For one class with simple configuration, skip the composition root entirely:
-
-```csharp
-using RemoteFacadeHost.Client;
-
-var store = RemoteFacade.For<IDocumentStore>("http://instance-a:8080");
-await store.WriteAsync("doc.json", payload);   // runs in the container
-```
-
-`RemoteFacade.For<T>` (from the `RemoteFacade.Client` package, namespace
-`RemoteFacade.Client`) returns a `DispatchProxy` implementing `T`. No code
-generation: your test project already references the library for its
-interface, the compiler enforces the contract, and nothing regenerates when
-the interface changes.
-
-Async calls are genuinely concurrent: the proxy returns the in-flight
-operation rather than blocking, so `Task.WhenAll(a.WriteAsync(...),
-b.WriteAsync(...))` really does overlap two instances. That is the point of the
-image — a contention test that secretly serialises its two clients proves
-nothing.
-
-The consequence is that an async call you never await may not complete. The
-container is doing the work, not your test process, so an un-awaited `Task` can
-outlive the assertion that was supposed to depend on it. Await every call, or
-hold the `Task` and await it later.
-
-`LIB_TYPE` names the type to construct, and it is no longer required to be a
-concrete class: **it may name an interface, resolved from the provider**,
-provided something registers an implementation for it (`LIB_SERVICES` or
-`LIB_REGISTRAR`). Measured directly:
-
-```
--e LIB_TYPE=CsLib.IRootFacade -e LIB_REGISTRAR=CsLib.GraphStartup.Configure
-```
-
-```
-$ curl http://host:8080/health
-{"type":"CsLib.IRootFacade"}
-$ curl -X POST http://host:8080/invoke -H 'Content-Type: application/json' \
-    -d '{"method":"Who","args":[]}'
-{"ok":true,"result":"root-facade"}
-```
-
-`LIB_TYPE` and `LIB_REGISTRAR` can be combined this way: the registrar wires
-the graph, and `LIB_TYPE` names the (possibly interface) root to serve every
-call against directly, without a `service` field.
-
-Methods the named interface **inherits** from a base interface are callable
-too — `IDerived : IBase` serves `IBase`'s members as well as its own, on both
-this path and the `service` field. Splitting a facade across interfaces is
-ordinary C#, and both directions of the protocol treat an inherited member as
-part of the contract.
-
-One caveat on configuration. An interface has no constructor, so `LIB_OPTIONS`
-is bound from the constructor of the **implementation**, taken from the
-`LIB_SERVICES` entry that names it:
-
-```
--e LIB_TYPE=CsLib.IStore -e LIB_OPTIONS='{"RootPath":"/mnt/share"}' \
--e LIB_SERVICES='{"CsLib.IStore":"CsLib.Store"}'
-```
-
-If the implementation is registered only by `LIB_REGISTRAR`, this host cannot
-identify it without inspecting service descriptors — which it deliberately
-does not do — so a non-empty `LIB_OPTIONS` in that shape is a fatal startup
-error naming both variables, rather than the implementation quietly receiving
-default options. Configure those options in your registrar instead.
-
-That error fires on exactly one shape: **an interface `LIB_TYPE` with no
-`LIB_SERVICES` entry for it**, and a non-empty `LIB_OPTIONS`. A named
-implementation is accepted whether or not it happens to ask for an
-`IOptions<T>`, and a concrete `LIB_TYPE` is never affected — one that cannot
-be constructed still fails with the constructor message that names the real
-mistake.
-
 ## Security
 
 **`/invoke` executes arbitrary methods on whatever assembly is loaded, with
@@ -444,10 +358,8 @@ you are willing to expose for the lifetime of the fixture.
 |---|---|---|
 | `LIB_DIR` | `/plugin` | Directory containing the plugin's `dotnet publish` output. |
 | `LIB_ASSEMBLY` | *(required)* | Assembly file name inside `LIB_DIR`, e.g. `CsLib.dll`. |
-| `LIB_TYPE` | unset | Fully-qualified name of the type (or, if registered, interface) to construct. Selects single-instance mode. Either this or `LIB_REGISTRAR` is required; setting neither is a fatal startup error naming both variables. |
-| `LIB_OPTIONS` | `{}` | JSON bound into whatever `IOptions<T>` the root asks for. Only consulted when `LIB_TYPE` is set — composition-root mode (no `LIB_TYPE`) ignores it, since there is no single root to bind for. When `LIB_TYPE` names an **interface**, the options come from the constructor of the implementation `LIB_SERVICES` names for it; an implementation supplied only by `LIB_REGISTRAR` cannot be found this way, so an interface `LIB_TYPE` with no `LIB_SERVICES` entry and a non-empty `LIB_OPTIONS` is a **fatal startup error** rather than silently ignored — configure those options inside your registrar instead. A concrete `LIB_TYPE`, or an interface that *is* named in `LIB_SERVICES`, is never refused by that check. |
 | `LIB_SERVICES` | `{}` | JSON map of interface name to implementing type name, both resolved from the plugin assembly — see [Substituting a dependency](#substituting-a-dependency). |
-| `LIB_REGISTRAR` | unset | `Namespace.Type.Method` naming a static method that takes an `IServiceCollection`, for wiring the host can't express declaratively. Runs *before* `LIB_SERVICES`, so the explicit map can still override anything it registers. Leaving `LIB_TYPE` unset while this is set selects composition-root mode. |
+| `LIB_REGISTRAR` | **required** | `Namespace.Type.Method` naming a static method that takes an `IServiceCollection`. This is how a container is told what to serve. Runs *before* `LIB_SERVICES`, so the explicit map can still override anything it registers. Unset is a fatal startup error. |
 | `LIB_CALLBACKS` | `{}` | JSON map of interface name to an HTTP base URL on the test runner — see [Substituting a dependency](#substituting-a-dependency). |
 | `LIB_PORT` | `8080` | HTTP port the host listens on. |
 | `SMB_SERVER` | unset | SMB server to mount before serving. Must be set together with `SMB_SHARE`. |
@@ -479,7 +391,7 @@ docker run --cap-add SYS_ADMIN --cap-add DAC_READ_SEARCH \
 Bodies below were captured from real containers: `CsLib.Store` (the `IStore`
 fixture under `test/fixtures/CsLib`, single-instance mode) for `/health`,
 `/types` and the base `/invoke` shape, and `CsLib.GraphStartup` (composition
-root, `LIB_REGISTRAR=CsLib.GraphStartup.Configure`, no `LIB_TYPE`) for
+root, `LIB_REGISTRAR=CsLib.GraphStartup.Configure`) for
 `/services` and the `service`-qualified `/invoke` shape.
 
 ### `GET /health`
@@ -503,7 +415,7 @@ $ curl http://host:8080/types
 ```
 
 Every public type the loaded assembly actually exports. This exists because a
-wrong `LIB_TYPE` is otherwise a dead end — see [the VB note](#a-note-for-vb-libraries)
+wrong service or registrar name is otherwise a dead end — see [the VB note](#a-note-for-vb-libraries)
 below for the case that motivated it.
 
 ### `GET /services`
@@ -552,7 +464,7 @@ thrown exception (sync or from a faulted `Task`) comes back as
 `{"ok":false,"error":"<the exception's own Message>"}` instead of an
 unhandled 500.
 
-**In composition-root mode** (no `LIB_TYPE`), there is no single instance to
+There is no single instance to
 dispatch against, so the request must name which registered service it
 wants, via a `service` field carrying the service's full type name:
 
@@ -563,12 +475,12 @@ $ curl -X POST http://croot:8080/invoke -H 'Content-Type: application/json' \
 
 $ curl -X POST http://croot:8080/invoke -H 'Content-Type: application/json' \
     -d '{"method":"Who","args":[]}'
-{"ok":false,"error":"this host is in composition-root mode (no LIB_TYPE), so a
+{"ok":false,"error":"every call must name the service it wants in the
 call must name the service it wants in the \"service\" field."}
 ```
 
 An unregistered or unknown `service` names itself and lists what *is*
-registered, the same way an unrecognized `LIB_TYPE` does at startup:
+registered:
 
 ```
 $ curl -X POST http://croot:8080/invoke -H 'Content-Type: application/json' \
@@ -647,83 +559,6 @@ serving. A fixture that treats `ResetAsync()` throwing as "the reset didn't
 happen, abort" is drawing the wrong conclusion, and one that retries will
 reset twice.
 
-## Constructing the instance
-
-In single-instance mode, one instance is built at startup and lives for the
-container's lifetime; every `/invoke` call reaches that same object. That's
-deliberate — it's what lets one call acquire a resource (a lock, an open
-handle) and a later call release it, faithfully reproducing a real deployed
-instance. The corollary is that calls are concurrent (ASP.NET serves them in
-parallel against the one object) and state outlives any single test (use
-`DELETE /instance` to reset).
-
-The type is resolved against a real `Microsoft.Extensions.DependencyInjection`
-service collection, so dependencies can nest arbitrarily. The container asks
-the **provider itself** first — `provider.GetService(rootType)` — which is
-what lets `LIB_TYPE` name an interface, and what makes a factory registration
-(`services.AddSingleton(sp => new Thing("x"))`) actually get used. Only when
-the provider has no registration for it does the host fall back to building
-it directly via `ActivatorUtilities`.
-
-**That provider-first order has a real, measured consequence for a type with
-more than one public constructor.** `ActivatorUtilities.CreateInstance`
-honours `[ActivatorUtilitiesConstructor]` and, absent that, picks the
-greediest constructor it can satisfy. The container's own activator — the
-path taken whenever a registrar registers the root type or interface itself,
-e.g. `services.AddSingleton<Root>()` — does neither:
-
-- **`[ActivatorUtilitiesConstructor]` is ignored.** A root with two public
-  constructors, one attributed, resolves through the *unattributed* one when
-  it has more resolvable parameters — confirmed directly: `WhichCtor()`
-  returned `"two"` (the plain, two-parameter constructor), not
-  `"attributed-one"`.
-- **A genuine tie throws, where `ActivatorUtilities` would not have.** Two
-  constructors with the *same* parameter count, both fully resolvable, make
-  the container refuse to pick one at all:
-
-  ```
-  cannot construct MyApp.Ambi: Unable to activate type 'MyApp.Ambi'. The
-  following constructors are ambiguous:
-  Void .ctor(Microsoft.Extensions.Logging.ILogger`1[MyApp.Ambi])
-  Void .ctor(Microsoft.Extensions.Options.IOptions`1[MyApp.Opts]). Register
-  it or its missing dependency in your LIB_REGISTRAR startup, or name an
-  implementation in LIB_SERVICES as {"Full.IService":"Full.Implementation"}.
-  ```
-
-  Measured by registering exactly this shape (`services.AddSingleton<Ambi>()`
-  against a type with two single-parameter constructors, both satisfiable):
-  the container fails at startup rather than silently picking either one.
-
-Both behaviors only apply to a root the registrar (or `LIB_SERVICES`)
-actually registers. A root left for the `ActivatorUtilities` fallback —
-`LIB_TYPE` naming an ordinary concrete class nothing else registers — keeps
-the original `ActivatorUtilities` semantics: `[ActivatorUtilitiesConstructor]`
-honoured, ties broken by picking the greediest resolvable constructor rather
-than refusing.
-
-Out of the box, whenever `LIB_TYPE` is set the container knows how to
-satisfy, for the root's own (greediest) constructor — whichever path ends up
-building it:
-
-- **`IOptions<T>`** — `T` is bound from the `LIB_OPTIONS` JSON. When
-  `LIB_TYPE` names an interface, `T` comes from the constructor of the
-  implementation named for it in `LIB_SERVICES` instead.
-- **`ILogger<T>`** — supplied automatically via `AddLogging()`.
-- **A concrete class dependency** (e.g. `Store(GitConfigManager config)`) —
-  auto-registered as itself, recursively, so an ordinary constructor
-  dependency graph doesn't need to be hand-registered one type at a time.
-
-Anything else — an interface with no fake or callback named for it, most
-commonly — fails fast at startup with a message naming exactly what's
-missing:
-
-```
-cannot construct CsLib.Store: Unable to resolve service for type
-'CsLib.IStamp' while attempting to activate 'CsLib.Store'.. Register it or its
-missing dependency in your LIB_REGISTRAR startup, or name an implementation in
-LIB_SERVICES as {"Full.IService":"Full.Implementation"}.
-```
-
 ## Substituting a dependency
 
 Two mechanisms exist because a **fake** and a **mock** live in different
@@ -788,11 +623,11 @@ unlike C# where a file's `namespace` is absolute. A VB library's real,
 fully-qualified type name is therefore often not what a C# developer would
 guess — a class declared as `Namespace VbLib ... Class VbStore` in a project
 whose `RootNamespace` is left at its default (the project name) is not
-`VbLib.VbStore`, it's `VbLib.VbLib.VbStore`. Point `LIB_TYPE` at the wrong one
+`VbLib.VbStore`, it's `VbLib.VbLib.VbStore`. Point `LIB_REGISTRAR` at the wrong one
 and the host fails at startup with:
 
 ```
-type '<LIB_TYPE>' not found in <LIB_ASSEMBLY>. Available: <every exported type, comma-separated>
+LIB_REGISTRAR names type '<name>', which is not in the assembly. Available: <every exported type, comma-separated>
 ```
 
 `GET /types` lists what the assembly actually contains, which is the fastest
