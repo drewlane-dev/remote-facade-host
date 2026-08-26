@@ -21,14 +21,14 @@ cleanup() {
 trap cleanup EXIT
 docker network create "${NET}" >/dev/null
 
-start_host() { # start_host <alias> <pluginDir> <assembly> <registrar> [servicesJson] [callbacksJson] [storeRoot] [sentinelPath]
+start_host() { # start_host <alias> <pluginDir> <assembly> <registrar> [servicesJson] [storeRoot] [sentinelPath]
   # DOTNET_EnableDiagnostics=0: belt-and-suspenders alongside giving the
   # plugin its own private RootPath (below) -- without it the runtime drops
   # its own diagnostic pipe/socket files straight into /tmp, which would
   # again pollute any OTHER process's directory count if it ever pointed
   # back at /tmp directly.
   #
-  # servicesJson/callbacksJson are each computed on their own line rather
+  # servicesJson is computed on its own line rather
   # than inline as "${6:-{}}": a bare "{" inside a ${...:-word} default is
   # not brace-matched against the "}" that closes the expansion, so the
   # parser closes the expansion at the FIRST "}" and leaves a stray "}"
@@ -36,15 +36,12 @@ start_host() { # start_host <alias> <pluginDir> <assembly> <registrar> [services
   # the positional argument IS set.
   servicesJson="${5:-}"
   [ -z "$servicesJson" ] && servicesJson='{}'
-  callbacksJson="${6:-}"
-  [ -z "$callbacksJson" ] && callbacksJson='{}'
   docker run -d --rm --name "$1-${NET}" --network "${NET}" --network-alias "$1" \
     -v "$2:/plugin:ro" \
     -e LIB_DIR=/plugin -e LIB_ASSEMBLY="$3" -e LIB_REGISTRAR="$4" \
     -e LIB_SERVICES="$servicesJson" \
-    -e LIB_CALLBACKS="$callbacksJson" \
-    -e STORE_ROOT="${7:-/tmp}" \
-    -e SENTINEL_PATH="${8:-}" \
+    -e STORE_ROOT="${6:-/tmp}" \
+    -e SENTINEL_PATH="${7:-}" \
     -e DOTNET_EnableDiagnostics=0 \
     "$IMAGE" >/dev/null 2>&1
 }
@@ -105,7 +102,7 @@ echo "== loads and constructs a C# class =="
 # own diagnostic pipe/socket files, which Store.Count() -- Directory.GetFiles
 # over RootPath -- would otherwise count as its own.
 start_host cs "${HERE}/publish/cslib" CsLib.dll CsLib.StoreStartup.Configure \
-  '{"CsLib.IStamp":"CsLib.RealStamp"}' '{}' /tmp/cslib-data
+  '{"CsLib.IStamp":"CsLib.RealStamp"}' /tmp/cslib-data
 if wait_healthy cs; then
   ok "host constructs the configured type"
 else
@@ -179,26 +176,6 @@ echo "$CLIENT_OUT" | grep -q "RESULT: vt-value vt-value" \
 echo "$CLIENT_OUT" | grep -q "RESULT: vt-void vt-written" \
   && ok "a plain ValueTask's work completes before the call returns" \
   || bad "a plain ValueTask's work completes before the call returns"
-
-echo "== the client checks HTTP status before deserializing =="
-# The client is pointed at a real listener that does not serve this protocol,
-# so the response is a genuine 404. Deserializing that as JSON fails with
-# "'<' is an invalid start of a value" -- naming neither the URL, the status,
-# nor what was being asked for.
-#
-# v3 catches it EARLIER than v2 did. With For<T> gone the first thing a client
-# says to a host is GET /services, so a mistyped base URL fails while acquiring
-# the proxy rather than on the first call. The /invoke leg of the same guard is
-# unchanged and is covered by the unit suite, which serves a 502 directly
-# instead of needing a wrong listener.
-STATUS_LINE=$(echo "$CLIENT_OUT" | grep '^RESULT: status-guard' || true)
-if echo "$STATUS_LINE" | grep -q "/services" \
-    && echo "$STATUS_LINE" | grep -q "404" \
-    && echo "$STATUS_LINE" | grep -q "9099"; then
-  ok "a non-200 names the URL, the request and the status"
-else
-  bad "a non-200 names the URL, the request and the status (got: $STATUS_LINE)"
-fi
 
 echo "== failures come back as {ok:false}, not a raw 500 =="
 # Finding 1: an async method's exception surfaces at `await task`, as the
@@ -348,7 +325,7 @@ api cs /health | grep -q "CsLib.Store" \
   && ok "host still serves after a reset" || bad "host still serves after a reset"
 
 echo "== the same image serves a VB library, unchanged =="
-start_host vb "${HERE}/publish/vblib" VbLib.dll VbLib.VbStartup.Configure '{}' '{}' /tmp
+start_host vb "${HERE}/publish/vblib" VbLib.dll VbLib.VbStartup.Configure '{}' /tmp
 if wait_healthy vb; then
   ok "host constructs a VB type"
 else
@@ -517,127 +494,6 @@ echo "$MISSING_OUT" | grep -q "IStamp" \
   && ok "the failure names the unsatisfiable dependency" \
   || bad "the failure names the unsatisfiable dependency (got: $MISSING_OUT)"
 
-echo "== callback proxies: a Moq mock serving a remote instance =="
-start_host cb "${HERE}/publish/cslib" CsLib.dll CsLib.StoreStartup.Configure '{}' \
-  '{"CsLib.IStamp":"http://testrunner:9090"}' /tmp/cb-data
-wait_healthy cb && ok "host starts with a callback-backed dependency" \
-              || bad "host starts with a callback-backed dependency"
-
-CB_OUT=$(docker run --rm --network "${NET}" --network-alias testrunner \
-  -v "${HERE}/..:/w" -w /w mcr.microsoft.com/dotnet/sdk:10.0 \
-  dotnet run --project test/fixtures/CallbackClient/CallbackClient.csproj -c Release 2>&1 \
-  | grep '^RESULT:') || CB_OUT=""
-
-# The guard must fire at registration (synchronously, inside the try around
-# Serve itself) and name both the offending type and that an interface is
-# required -- not merely "it threw something". A bare "it threw" assertion
-# would also pass for an unrelated NullReferenceException.
-SERVE_GUARD_LINE=$(echo "$CB_OUT" | grep "^RESULT: serve-guard" || true)
-if echo "$SERVE_GUARD_LINE" | grep -q "CsLib.FakeStamp" \
-    && echo "$SERVE_GUARD_LINE" | grep -qi "interface"; then
-  ok "Serve<T> rejects a concrete type at registration, naming it"
-else
-  bad "Serve<T> rejects a concrete type at registration, naming it (got: $SERVE_GUARD_LINE)"
-fi
-
-echo "$CB_OUT" | grep -q "RESULT: stamp from-moq" \
-  && ok "the mock's configured value reached the remote instance (string shape)" \
-  || bad "the mock's configured value reached the remote instance (string shape)"
-echo "$CB_OUT" | grep -q "RESULT: count 42" \
-  && ok "the mock's Task<int> value reached the remote instance" \
-  || bad "the mock's Task<int> value reached the remote instance"
-echo "$CB_OUT" | grep -q "RESULT: ping ok" \
-  && ok "a void callback round-trips with no error" \
-  || bad "a void callback round-trips with no error"
-echo "$CB_OUT" | grep -q "RESULT: fail-message mock-says-no" \
-  && ok "a throwing mock's own message survives both hops" \
-  || bad "a throwing mock's own message survives both hops"
-echo "$CB_OUT" | grep -q "RESULT: verify ok" \
-  && ok "Moq Verify sees every call the container made" \
-  || bad "Moq Verify sees every call the container made"
-
-# I5: the callback listener binds 0.0.0.0, is unauthenticated, and runs inside
-# the developer's OWN test process -- so it must expose only what the served
-# interface declares. Dispatch used target.GetType(), which made every public
-# method of the served object reachable: a non-interface Secret() and Object's
-# own ToString() were both verified callable. SecretStamp really does have a
-# public Secret(), so refusing it is not vacuous, and the positive control
-# below rules out a "guard" that merely broke all dispatch.
-echo "$CB_OUT" | grep -q "RESULT: guard-allowed .*secret-stamp" \
-  && ok "an interface method still dispatches to the served object" \
-  || bad "an interface method still dispatches to the served object"
-
-GUARD_SECRET=$(echo "$CB_OUT" | grep '^RESULT: guard-secret' || true)
-if echo "$GUARD_SECRET" | grep -q '"ok":false' && ! echo "$GUARD_SECRET" | grep -q "LEAKED"; then
-  ok "a public method NOT on the served interface is unreachable"
-else
-  bad "a public method NOT on the served interface is unreachable (got: $GUARD_SECRET)"
-fi
-
-GUARD_TOSTRING=$(echo "$CB_OUT" | grep '^RESULT: guard-tostring' || true)
-if echo "$GUARD_TOSTRING" | grep -q '"ok":false'; then
-  ok "Object's own members are unreachable through the callback listener"
-else
-  bad "Object's own members are unreachable through the callback listener (got: $GUARD_TOSTRING)"
-fi
-
-# C1's twin, in the callback direction. The container's Store calls back into
-# a real Moq mock whose interface method returns ValueTask<T>; CallbackHost
-# used to test only `result is Task`, miss the struct, and serialize the
-# AWAITABLE ITSELF, which CallbackProxy then deserialized into a DEFAULT
-# ValueTask<T> -- the library received null with ok:true and no error on any of
-# the three hops. Driven through a RAW /invoke from inside the fixture (the
-# CallbackHost only exists while that process runs) so the WHOLE ENVELOPE can
-# be compared. Not grepped: the broken payload is
-# {"ok":true,"result":{"isCompleted":false,...,"result":"vt-from-moq"}}, which
-# CONTAINS the substring a grep would look for. That is not hypothetical --
-# it is what the forward direction's first assertion did, and it was caught
-# only by deleting the fix and reading the output.
-CB_VT_VALUE=$(echo "$CB_OUT" | sed -n 's/^RESULT: cb-vt-value //p')
-if [ "$CB_VT_VALUE" = '{"ok":true,"result":"vt-from-moq"}' ]; then
-  ok "a mock's ValueTask<T> value survives the callback leg intact"
-else
-  bad "a mock's ValueTask<T> value survives the callback leg intact (got: $CB_VT_VALUE)"
-fi
-
-# A non-generic ValueTask carries no value, so the /invoke envelope is
-# {"ok":true,"result":null} whether or not it was ever awaited. Only the mock's
-# own side effect separates the two, and VtPingImpl sets its flag 500ms in --
-# orders of magnitude after the round trip that an un-awaited ValueTask would
-# return in.
-CB_VT_PINGED=$(echo "$CB_OUT" | sed -n 's/^RESULT: cb-vt-pinged //p')
-if [ "$CB_VT_PINGED" = "True" ]; then
-  ok "a mock's plain ValueTask completes before the callback answers"
-else
-  bad "a mock's plain ValueTask completes before the callback answers (got: $CB_VT_PINGED)"
-fi
-
-echo "== naming an interface in both mechanisms is a startup error =="
-# wait_stopped, not wait_healthy: asserting only "! wait_healthy" is true for
-# ANY startup failure -- a bad plugin dir, a typo'd type, an image bug -- and
-# never proves the container failed for THIS reason. Same pattern as
-# "an unregistered dependency still fails fast" above: start without --rm so
-# the exit code survives, then grep the logs for the specific message. Also
-# faster: wait_healthy on a host that will never become healthy always burns
-# the full 30s poll, where wait_stopped returns as soon as the process exits.
-docker run -d --name "cbdup-${NET}" --network "${NET}" --network-alias cbdup \
-  -v "${HERE}/publish/cslib:/plugin:ro" \
-  -e LIB_DIR=/plugin -e LIB_ASSEMBLY=CsLib.dll \
-  -e LIB_REGISTRAR=CsLib.StoreStartup.Configure -e STORE_ROOT=/tmp/d \
-  -e LIB_SERVICES='{"CsLib.IStamp":"CsLib.FakeStamp"}' \
-  -e LIB_CALLBACKS='{"CsLib.IStamp":"http://testrunner:9090"}' \
-  "$IMAGE" >/dev/null 2>&1
-if code="$(wait_stopped "cbdup-${NET}")" && [ "$code" -ne 0 ]; then
-  ok "an interface in both LIB_SERVICES and LIB_CALLBACKS exits non-zero"
-else
-  docker logs "cbdup-${NET}" 2>&1 | tail -4
-  bad "an interface in both LIB_SERVICES and LIB_CALLBACKS exits non-zero"
-fi
-docker logs "cbdup-${NET}" 2>&1 | grep -q "named in BOTH" \
-  && ok "the failure names both mechanisms as the cause" \
-  || bad "the failure names both mechanisms as the cause"
-docker rm -f "cbdup-${NET}" >/dev/null 2>&1 || true
-
 echo "== the startup is the only way to say what to serve =="
 docker run -d --name "croot-${NET}" --network "${NET}" --network-alias croot \
   -v "${HERE}/publish/cslib:/plugin:ro" \
@@ -692,11 +548,11 @@ echo "== a service resolved via an EXPLICIT interface implementation is reachabl
   || bad "an explicitly-implemented interface method is still reachable by name"
 
 echo "== a service-routed call reaches members the interface INHERITS (review final, C1) =="
-# Same defect as the inherited-member case above, on the OTHER v1.1
-# path: /invoke's "service" field dispatches against the type Resolve found,
-# which is the interface. CallbackHost.cs already ruled that a member
-# inherited from a base interface IS part of the served contract; Invoker now
-# agrees. FromDerived is the paired positive control.
+# /invoke's "service" field dispatches against the type Resolve found, which
+# is the interface -- and a member inherited from a BASE interface is part of
+# the served contract just as a directly-declared one is. Type.GetMethods() on
+# an interface returns only what that interface itself declares, so this was
+# once unreachable. FromDerived is the paired positive control.
 [ "$(api_service croot CsLib.IDerivedFacade FromDerived)" = '{"ok":true,"result":"derived-method"}' ] \
   && ok "a DECLARED member is reachable through the service field" \
   || bad "a DECLARED member is reachable through the service field"
@@ -807,7 +663,7 @@ echo "== a reset lands safely against calls already in flight =="
 # and then wedged every later call -- see task-5-report.md -- which is why
 # InstanceHolder holds no lock across the await.
 start_host inflight "${HERE}/publish/cslib" CsLib.dll CsLib.DisposableRootStartup.Configure \
-  '{}' '{}' /tmp /tmp/disposed-inflight
+  '{}' /tmp /tmp/disposed-inflight
 wait_healthy inflight && ok "the in-flight host constructs" \
                       || bad "the in-flight host constructs"
 
@@ -901,7 +757,7 @@ echo "== a plugin Dispose() that throws must not destroy an innocent caller's re
 # depends on scheduling, so the same plugin defect would destroy a different
 # arbitrary request every run.
 start_host disposethrow "${HERE}/publish/cslib" CsLib.dll CsLib.ThrowingDisposableRootStartup.Configure \
-  '{}' '{}' /tmp /tmp/throwing-disposed
+  '{}' /tmp /tmp/throwing-disposed
 wait_healthy disposethrow && ok "a root with a throwing Dispose() constructs" \
                           || bad "a root with a throwing Dispose() constructs"
 

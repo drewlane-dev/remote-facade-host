@@ -127,8 +127,7 @@ internal class RemoteFacade : DispatchProxy
         // invalid start of a value", and an oversized argument body draws a
         // bare 413 -- neither naming the interface, the method, the URL or the
         // status, and both arriving as a JSON error that reads like a protocol
-        // bug. CallbackProxy already guards the callback direction this way;
-        // both directions now fail identically.
+        // bug.
         if (!response.IsSuccessStatusCode)
         {
             throw new InvalidOperationException(
