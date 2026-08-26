@@ -37,3 +37,15 @@ public interface IGitProbe
 {
     string InitAndCommit(string dir);
 }
+
+/// <summary>
+/// v3 hosts every plugin through a startup, so the native-asset fixture needs
+/// one too. It registers nothing but the probe: what this fixture exercises is
+/// native library loading, not wiring.
+/// </summary>
+public static class NativeStartup
+{
+    public static void Configure(Microsoft.Extensions.DependencyInjection.IServiceCollection services) =>
+        Microsoft.Extensions.DependencyInjection.ServiceCollectionServiceExtensions
+            .AddSingleton<IGitProbe, GitProbe>(services);
+}

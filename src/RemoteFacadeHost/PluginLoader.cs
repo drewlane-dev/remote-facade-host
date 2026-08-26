@@ -18,20 +18,9 @@ public static class PluginLoader
     /// </summary>
     private static bool _resolverAttached;
 
-    public static Type Load(string dir, string assemblyFile, string typeName)
-    {
-        LoadAssembly(dir, assemblyFile);
-
-        return Assembly!.GetType(typeName)
-            ?? throw new InvalidOperationException(
-                $"type '{typeName}' not found in {assemblyFile}. " +
-                $"Available: {string.Join(", ", TypeNames())}");
-    }
-
     /// <summary>
-    /// Loads the plugin assembly without requiring a type name. Composition-root
-    /// mode needs the assembly (for the registrar and for resolving service names)
-    /// but names no single type.
+    /// Loads the plugin assembly. Nothing names a single type: the registrar
+    /// and the per-call service lookups are both resolved out of it by name.
     /// </summary>
     public static Assembly LoadAssembly(string dir, string assemblyFile)
     {
@@ -66,8 +55,9 @@ public static class PluginLoader
     public static Assembly? Assembly { get; private set; }
 
     /// <summary>
-    /// Public type names in the loaded assembly. Exists because a wrong LIB_TYPE
-    /// is otherwise a dead end — notably for VB libraries, where RootNamespace is
+    /// Public type names in the loaded assembly. Exists because a wrong
+    /// LIB_REGISTRAR or service name is otherwise a dead end — notably for VB
+    /// libraries, where RootNamespace is
     /// PREPENDED to declared namespaces, so the real name is often not what a C#
     /// developer would write.
     /// </summary>

@@ -14,8 +14,8 @@ public class InstanceHolderTests
     [Fact]
     public void Reset_with_nothing_in_flight_disposes_the_old_graph_immediately()
     {
-        var root = new CountingRoot();
-        var holder = new InstanceHolder(() => Graphs.Around(root));
+        var root = new Counted();
+        var holder = new InstanceHolder(() => Graphs.Named("only", root));
 
         holder.Reset();
 
@@ -25,9 +25,9 @@ public class InstanceHolderTests
     [Fact]
     public async Task Reset_during_a_call_does_not_dispose_until_the_call_returns()
     {
-        var first = new CountingRoot();
-        var graphs = new Queue<CountingRoot>([first, new CountingRoot()]);
-        var holder = new InstanceHolder(() => Graphs.Around(graphs.Dequeue()));
+        var first = new Counted();
+        var graphs = new Queue<Counted>([first, new Counted()]);
+        var holder = new InstanceHolder(() => Graphs.Named("g", graphs.Dequeue()));
 
         var insideCall = new TaskCompletionSource();
         var releaseCall = new TaskCompletionSource();
@@ -55,7 +55,7 @@ public class InstanceHolderTests
     [Fact]
     public async Task Reset_does_not_block_on_an_in_flight_call()
     {
-        var holder = new InstanceHolder(() => Graphs.Around(new CountingRoot()));
+        var holder = new InstanceHolder(() => Graphs.Named("g", new Counted()));
         var insideCall = new TaskCompletionSource();
         var releaseCall = new TaskCompletionSource();
 
@@ -84,9 +84,9 @@ public class InstanceHolderTests
     [Fact]
     public async Task A_retired_graph_is_disposed_exactly_once_however_many_callers_were_on_it()
     {
-        var root = new CountingRoot();
-        var graphs = new Queue<CountingRoot>([root, new CountingRoot()]);
-        var holder = new InstanceHolder(() => Graphs.Around(graphs.Dequeue()));
+        var root = new Counted();
+        var graphs = new Queue<Counted>([root, new Counted()]);
+        var holder = new InstanceHolder(() => Graphs.Named("g", graphs.Dequeue()));
 
         var release = new TaskCompletionSource();
         var arrived = new CountdownEvent(4);
@@ -114,10 +114,10 @@ public class InstanceHolderTests
     [Fact]
     public void A_factory_that_throws_leaves_the_previous_graph_serving()
     {
-        var root = new CountingRoot();
+        var root = new Counted();
         var fail = false;
         var holder = new InstanceHolder(() =>
-            fail ? throw new InvalidOperationException("startup failed") : Graphs.Around(root));
+            fail ? throw new InvalidOperationException("startup failed") : Graphs.Named("original", root));
 
         fail = true;
         Assert.Throws<InvalidOperationException>(holder.Reset);
@@ -126,14 +126,14 @@ public class InstanceHolderTests
         // rebuild that retired the current one would leave every later call
         // hitting a disposed provider.
         Assert.Equal(0, root.Disposals);
-        Assert.Same(root, holder.Use(g => g.Root));
+        Assert.Equal("original", holder.Use(g => g.ServiceNames[0]));
     }
 
     [Fact]
     public void A_root_whose_Dispose_throws_propagates_on_the_immediate_reset_path()
     {
-        var root = new CountingRoot { ThrowOnDispose = true };
-        var holder = new InstanceHolder(() => Graphs.Around(root));
+        var root = new Counted { ThrowOnDispose = true };
+        var holder = new InstanceHolder(() => Graphs.Named("g", root));
 
         // Reported to the operator who asked for the reset, rather than
         // swallowed -- DELETE /instance answers 500 and says why.
@@ -144,9 +144,9 @@ public class InstanceHolderTests
     [Fact]
     public async Task A_root_whose_Dispose_throws_on_the_DEFERRED_path_does_not_fault_the_call()
     {
-        var root = new CountingRoot { ThrowOnDispose = true };
-        var graphs = new Queue<CountingRoot>([root, new CountingRoot()]);
-        var holder = new InstanceHolder(() => Graphs.Around(graphs.Dequeue()));
+        var root = new Counted { ThrowOnDispose = true };
+        var graphs = new Queue<Counted>([root, new Counted()]);
+        var holder = new InstanceHolder(() => Graphs.Named("g", graphs.Dequeue()));
 
         var inside = new TaskCompletionSource();
         var release = new TaskCompletionSource();
@@ -166,20 +166,18 @@ public class InstanceHolderTests
     [Fact]
     public async Task A_call_started_before_a_reset_keeps_the_graph_it_started_on()
     {
-        var first = new CountingRoot();
-        var second = new CountingRoot();
-        var graphs = new Queue<CountingRoot>([first, second]);
-        var holder = new InstanceHolder(() => Graphs.Around(graphs.Dequeue()));
+        var names = new Queue<string>(["first", "second"]);
+        var holder = new InstanceHolder(() => Graphs.Named(names.Dequeue(), new Counted()));
 
         var inside = new TaskCompletionSource();
         var release = new TaskCompletionSource();
-        object? seen = null;
+        string? seen = null;
 
         var call = holder.UseAsync(async g =>
         {
             inside.SetResult();
             await release.Task;
-            seen = g.Root;          // read AFTER the reset has happened
+            seen = g.ServiceNames[0];   // read AFTER the reset has happened
             return 1;
         });
 
@@ -188,7 +186,7 @@ public class InstanceHolderTests
         release.SetResult();
         await call;
 
-        Assert.Same(first, seen);
-        Assert.Same(second, holder.Use(g => g.Root));
+        Assert.Equal("first", seen);
+        Assert.Equal("second", holder.Use(g => g.ServiceNames[0]));
     }
 }

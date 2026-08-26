@@ -101,6 +101,15 @@ public static class Registration
     {
         services.AddSingleton<IStamp, RealStamp>();
         services.AddSingleton<Configured>(_ => new ConfiguredFromFactory());
+
+        // Store itself, so this method is a complete composition root rather
+        // than a fragment. v2 could name the class in LIB_TYPE and let the
+        // host construct it alongside whatever this registered; v3 has no such
+        // side channel, so the startup must register everything it serves.
+        var root = Environment.GetEnvironmentVariable("STORE_ROOT") ?? "/tmp";
+        services.Configure<StoreOptions>(o => o.RootPath = root);
+        services.AddSingleton<Store>();
+        services.AddSingleton<IStore>(sp => sp.GetRequiredService<Store>());
         return services;
     }
 }
@@ -508,7 +517,41 @@ public sealed class DisposableRoot(IOptions<DisposableOptions> options) : IDispo
 /// tracks and disposes it.</summary>
 public static class DisposableRootStartup
 {
-    public static void Configure(IServiceCollection services) => services.AddSingleton<DisposableRoot>();
+    public static void Configure(IServiceCollection services)
+    {
+        // Env var rather than LIB_OPTIONS, which v3 removed. Each test needs
+        // its OWN sentinel file: they count lines to tell "disposed once" from
+        // "disposed twice", and a shared path would make every run after the
+        // first read the previous run's writes.
+        var sentinel = Environment.GetEnvironmentVariable("SENTINEL_PATH");
+        if (!string.IsNullOrWhiteSpace(sentinel))
+        {
+            services.Configure<DisposableOptions>(o => o.SentinelPath = sentinel);
+        }
+
+        services.AddSingleton<DisposableRoot>();
+
+        // v2 paired LIB_TYPE=DisposableRoot with LIB_REGISTRAR=GraphStartup.
+        // One registrar is all there is now, so composing is how two sets of
+        // registrations combine -- which is ordinary C#, and the point.
+        GraphStartup.Configure(services);
+    }
+}
+
+/// <summary>The throwing twin, registered the same way.</summary>
+public static class ThrowingDisposableRootStartup
+{
+    public static void Configure(IServiceCollection services)
+    {
+        var sentinel = Environment.GetEnvironmentVariable("SENTINEL_PATH");
+        if (!string.IsNullOrWhiteSpace(sentinel))
+        {
+            services.Configure<DisposableOptions>(o => o.SentinelPath = sentinel);
+        }
+
+        services.AddSingleton<ThrowingDisposableRoot>();
+        GraphStartup.Configure(services);
+    }
 }
 
 /// <summary>Registers DisposableRoot as a ready-made INSTANCE -- the
@@ -783,6 +826,72 @@ public static class OptionsFacadeStartup
     public static void Configure(IServiceCollection services)
     {
         services.AddSingleton<IStamp, RealStamp>();
-        services.AddSingleton<IStore, Store>();
+
+        // Registered BOTH ways, resolving to ONE instance. v2 could name the
+        // concrete class as LIB_TYPE and reach every public method on it,
+        // including those IStore does not declare. Routing by service name
+        // dispatches against the type NAMED, so without a concrete
+        // registration those methods would become unreachable -- and the
+        // second registration must delegate rather than construct, or the two
+        // names would hand out two different objects and the file-locking
+        // cases would stop contending with each other.
+        services.AddSingleton<Store>();
+        services.AddSingleton<IStore>(sp => sp.GetRequiredService<Store>());
+    }
+}
+
+/// <summary>
+/// The startup the converted suite drives. It exists because v3 removed
+/// LIB_TYPE and LIB_OPTIONS, so both jobs those did -- naming the type to serve
+/// and configuring its options -- now belong here, in ordinary C#.
+///
+/// Configuration arrives as an environment variable read by this method. That
+/// is the migration path for anything that used to be LIB_OPTIONS: the startup
+/// is plugin code, so it can read env vars, files, or anything else, and it can
+/// do so with the real types rather than through a JSON binder the host owns.
+/// </summary>
+public static class StoreStartup
+{
+    public static void Configure(IServiceCollection services)
+    {
+        var root = Environment.GetEnvironmentVariable("STORE_ROOT") ?? "/tmp";
+
+        services.Configure<StoreOptions>(o => o.RootPath = root);
+
+        // The default. LIB_SERVICES can still Replace it with FakeStamp or
+        // SecretStamp, and LIB_CALLBACKS can point it at a mock in the test
+        // process -- both apply after this method runs.
+        services.AddSingleton<IStamp, RealStamp>();
+
+        // Registered BOTH ways, resolving to ONE instance. v2 could name the
+        // concrete class as LIB_TYPE and reach every public method on it,
+        // including those IStore does not declare. Routing by service name
+        // dispatches against the type NAMED, so without a concrete
+        // registration those methods would become unreachable -- and the
+        // second registration must delegate rather than construct, or the two
+        // names would hand out two different objects and the file-locking
+        // cases would stop contending with each other.
+        services.AddSingleton<Store>();
+        services.AddSingleton<IStore>(sp => sp.GetRequiredService<Store>());
+    }
+}
+
+/// <summary>
+/// Deliberately incomplete: registers Store but not the IStamp its constructor
+/// needs.
+///
+/// v2 caught this at startup, because LIB_TYPE made the host construct the
+/// root eagerly. v3 resolves per call, so the same mistake surfaces at the
+/// first call that needs it -- later, but naming the same missing type, and
+/// without the host having to construct anything before it knows what will be
+/// asked for.
+/// </summary>
+public static class IncompleteStartup
+{
+    public static void Configure(IServiceCollection services)
+    {
+        services.Configure<StoreOptions>(o => o.RootPath = "/tmp");
+        services.AddSingleton<Store>();
+        services.AddSingleton<IStore>(sp => sp.GetRequiredService<Store>());
     }
 }

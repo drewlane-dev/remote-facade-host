@@ -4,15 +4,17 @@ using RemoteFacadeHost;
 namespace RemoteFacade.UnitTests;
 
 /// <summary>
-/// The rejection messages a composition-root mistake produces. Successful
-/// resolution needs PluginLoader.Assembly, which only a real loaded plugin
-/// sets, so it stays with the container suite -- faking it here would test
-/// the fake.
+/// The rejection messages a composition-root mistake produces, and the
+/// disposal guarantee.
+///
+/// Successful resolution needs PluginLoader.Assembly, which only a real loaded
+/// plugin sets, so it stays with the container suite -- faking it here would
+/// test the fake.
 /// </summary>
 public class HostedGraphTests
 {
     private static HostedGraph Graph(params string[] scoped) =>
-        new(new ServiceCollection().BuildServiceProvider(), null, false,
+        new(new ServiceCollection().BuildServiceProvider(),
             ["Some.IThing", "Some.IOther"], new HashSet<string>(scoped));
 
     [Fact]
@@ -55,56 +57,36 @@ public class HostedGraphTests
     }
 
     [Fact]
-    public void A_root_the_provider_owns_is_not_disposed_twice()
+    public void Disposing_the_graph_disposes_the_singletons_the_provider_created()
     {
-        // Double disposal is made impossible rather than merely harmless:
-        // nothing guarantees a third-party type's Dispose() is idempotent.
-        // Registered BY TYPE, not as an instance. A container does not dispose
-        // an object it did not create, so AddSingleton(instance) would leave
-        // this at zero and the test would pass while proving nothing.
+        // v3's whole disposal story. With LIB_TYPE gone there is no root the
+        // container did not build, so .NET's own rule -- the provider disposes
+        // what it created -- covers everything, and HostedGraph no longer needs
+        // a separate branch that had to avoid double-disposing.
+        var tracked = new Counted();
         var services = new ServiceCollection();
-        services.AddSingleton<CountingRoot>();
+        services.AddSingleton(_ => tracked);
         var provider = services.BuildServiceProvider();
-        var root = provider.GetRequiredService<CountingRoot>();
+        _ = provider.GetRequiredService<Counted>();
 
-        new HostedGraph(provider, root, rootOwnedByProvider: true, [], new HashSet<string>()).Dispose();
+        new HostedGraph(provider, [], new HashSet<string>()).Dispose();
 
-        // Exactly one: the provider disposes it, and HostedGraph deliberately
-        // skips it. Drop that skip and this reads 2.
-        Assert.Equal(1, root.Disposals);
+        Assert.Equal(1, tracked.Disposals);
     }
 
     [Fact]
-    public void A_root_the_provider_does_NOT_own_is_disposed_by_the_graph()
+    public void A_singleton_that_was_never_resolved_is_never_disposed()
     {
-        // Built by ActivatorUtilities, never handed to the container, so
-        // nothing else tracks it. v1.0 leaked one of these per reset.
-        var root = new CountingRoot();
-
-        new HostedGraph(new ServiceCollection().BuildServiceProvider(), root, false, [], new HashSet<string>())
-            .Dispose();
-
-        Assert.Equal(1, root.Disposals);
-    }
-
-    [Fact]
-    public void A_root_whose_Dispose_throws_still_lets_the_provider_dispose()
-    {
-        // Measured once: a throwing root took the provider down with it, and
-        // every singleton the graph held leaked while the host kept reporting
-        // itself healthy.
+        // Registered is not created. This is not a defect to fix -- it is the
+        // container's own rule -- but it IS the trap that made two container
+        // cases read "disposed 0 times" for a host behaving correctly, so it
+        // is pinned here rather than rediscovered.
+        var tracked = new Counted();
         var services = new ServiceCollection();
-        services.AddSingleton<CountingRoot>();
-        var provider = services.BuildServiceProvider();
-        var singleton = provider.GetRequiredService<CountingRoot>();
+        services.AddSingleton(_ => tracked);
 
-        // The throwing root is NOT provider-owned, so HostedGraph disposes it
-        // itself -- which is the path where the throw could escape and skip
-        // the provider.
-        var root = new CountingRoot { ThrowOnDispose = true };
-        var graph = new HostedGraph(provider, root, false, [], new HashSet<string>());
+        new HostedGraph(services.BuildServiceProvider(), [], new HashSet<string>()).Dispose();
 
-        Assert.Throws<InvalidOperationException>(graph.Dispose);
-        Assert.Equal(1, singleton.Disposals);
+        Assert.Equal(0, tracked.Disposals);
     }
 }
