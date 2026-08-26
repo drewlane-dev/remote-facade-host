@@ -1,0 +1,54 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Needed only by the two-instance case, which mounts a real share.
+      - name: Ensure kernel cifs support
+        run: |
+          sudo modprobe cifs \
+            || (sudo apt-get update \
+                && sudo apt-get install -y "linux-modules-extra-$(uname -r)" \
+                && sudo modprobe cifs)
+          grep -qw cifs /proc/filesystems && echo "cifs OK"
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Publish test fixtures
+        run: |
+          dotnet publish test/fixtures/CsLib/CsLib.csproj -c Release -o test/publish/cslib
+          dotnet publish test/fixtures/VbLib/VbLib.vbproj -c Release -o test/publish/vblib
+          # Carries native assets under runtimes/{rid}/native -- the fixture the
+          # native-resolution cases drive.
+          dotnet publish test/fixtures/NativeLib/NativeLib.csproj -c Release -o test/publish/nativelib
+
+
+      # Fast, no Docker, and BEFORE the image build on purpose: a logic
+      # regression should fail in seconds rather than after an image build and
+      # a container suite.
+      - name: Unit tests
+        run: dotnet test test/unit/RemoteFacade.UnitTests/RemoteFacade.UnitTests.csproj
+
+      - name: Build image
+        run: docker build -t remote-facade-host:dev .
+
+      - name: Self-tests
+        run: ./test/run.sh remote-facade-host:dev
+
+      # Testcontainers against the image just built. Complements test/run.sh
+      # rather than repeating it: run.sh pins the wire format with curl, this
+      # proves the CLIENT PACKAGE can drive the composition path.
+      - name: Integration tests (Testcontainers)
+        env:
+          REMOTE_FACADE_IMAGE: remote-facade-host:dev
+        run: dotnet test test/integration/RemoteFacade.IntegrationTests/RemoteFacade.IntegrationTests.csproj

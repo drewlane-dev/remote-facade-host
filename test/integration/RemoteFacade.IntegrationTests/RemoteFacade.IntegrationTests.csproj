@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="xunit.v3" Version="3.1.0" />
+    <PackageReference Include="Microsoft.Testing.Extensions.TrxReport" Version="1.8.3" />
+    <PackageReference Include="Testcontainers" Version="4.6.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      The real client package's source, and the fixture library whose
+      composition root is under test. CsLib is referenced for its INTERFACES
+      only; the code that runs lives in the container, loaded from the
+      published copy this test mounts.
+    -->
+    <ProjectReference Include="..\..\..\src\RemoteFacade.Client\RemoteFacade.Client.csproj" />
+    <ProjectReference Include="..\..\fixtures\CsLib\CsLib.csproj" />
+  </ItemGroup>
+
+</Project>

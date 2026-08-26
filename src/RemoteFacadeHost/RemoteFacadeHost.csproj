@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- Shared with plugins so type identities unify in the default load context.
+         Keep this list as small as possible: every package here is one the
+         plugin must agree with on version. -->
+    <PackageReference Include="Microsoft.Extensions.Options" Version="10.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.0" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="10.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Logging" Version="10.0.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- The unit tests exercise pure helpers that are deliberately not part of
+         the public surface. Widening them to public to make them testable
+         would ship API nobody should call. -->
+    <InternalsVisibleTo Include="RemoteFacade.UnitTests" />
+  </ItemGroup>
+
+</Project>

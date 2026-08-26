@@ -1,0 +1,176 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      # Lets this job request a GitHub OIDC token, which nuget.org exchanges
+      # for a short-lived API key. Without it NuGet/login has nothing to send.
+      id-token: write
+    steps:
+      # Fail fast on a malformed tag before touching the suite or any registry.
+      # The trigger glob (tags: ["v*"]) matches anything starting with "v" --
+      # a tag that isn't STRICT semver (e.g. "vfoo", or "v01.2.3" with a
+      # leading zero) would otherwise sail through, match none of the
+      # type=semver patterns below, and still publish an unversioned
+      # multi-arch image tagged ONLY "latest", silently overwriting the
+      # production latest. Leading zeros in major/minor/patch are rejected
+      # because docker/metadata-action parses with the real `semver`
+      # package, which treats them as invalid (semver.valid('01.2.3') is
+      # null) -- so a tag our regex accepted but semver didn't would hit
+      # this exact failure one step later. Build metadata (a trailing
+      # "+something") is rejected outright rather than parsed: "+" is not a
+      # legal character in a Docker tag and carries no meaning for this
+      # release process, so silently accepting it would only add a second
+      # way for the tag maths to disagree with the tag itself.
+      - name: Validate the tag is a well-formed release version
+        run: |
+          SEMVER='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$'
+          if ! [[ "${GITHUB_REF_NAME}" =~ $SEMVER ]]; then
+            echo "::error::'${GITHUB_REF_NAME}' is not a valid release tag (expected strict semver with a leading v and no leading zeros, e.g. v1.2.3 or v1.2.3-rc1; build metadata like +build1 is not accepted)." >&2
+            exit 1
+          fi
+
+      - uses: actions/checkout@v7
+
+      # Gate the publish on the suite passing for THIS commit. Without it a tag
+      # can publish bytes no test ever validated.
+      - name: Ensure kernel cifs support
+        run: |
+          sudo modprobe cifs \
+            || (sudo apt-get update \
+                && sudo apt-get install -y "linux-modules-extra-$(uname -r)" \
+                && sudo modprobe cifs)
+          grep -qw cifs /proc/filesystems && echo "cifs OK"
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Publish test fixtures
+        run: |
+          dotnet publish test/fixtures/CsLib/CsLib.csproj -c Release -o test/publish/cslib
+          dotnet publish test/fixtures/VbLib/VbLib.vbproj -c Release -o test/publish/vblib
+          # Carries native assets under runtimes/{rid}/native. Missing here, the
+          # native-resolution cases in the suite fail and the release stops --
+          # which is the correct outcome, but the fix is this line, not a skip.
+          dotnet publish test/fixtures/NativeLib/NativeLib.csproj -c Release -o test/publish/nativelib
+
+      # The client is the other half of the same wire protocol, so it carries the
+      # same version and ships from the same tag. Drift between them would be a
+      # protocol mismatch nobody could diagnose from either side alone.
+      #
+      # This runs BEFORE the self-tests, not merely before the pushes, and the
+      # ordering is load-bearing twice over:
+      #
+      #   1. Packing is purely local and fallible (a pack error, a bad version
+      #      string). It must fail before anything has been published, never
+      #      after the image is already live on GHCR with no client to match it.
+      #   2. `test/run.sh` runs `dotnet` inside containers as root, which leaves
+      #      root-owned obj/ directories in this project's source tree. A pack
+      #      attempted after that fails with "Access to the path ... is denied",
+      #      which is how v1.0.0's first release attempt died.
+      - name: Pack the client
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          dotnet pack src/RemoteFacade.Client/RemoteFacade.Client.csproj \
+            -c Release -p:Version="$VERSION" -o ./nupkg
+
+      # This is a separate `docker build` from the multi-arch push later in this
+      # job, so the published amd64 layer is not literally the same bytes that
+      # were tested here -- only the same Dockerfile and context. The build is
+      # deterministic, so the risk is low, but nobody should assume the pushed
+      # bytes and the tested bytes are byte-identical.
+
+      # Fast, no Docker, and BEFORE the image build on purpose: a logic
+      # regression should fail in seconds rather than after an image build and
+      # a container suite.
+      - name: Unit tests
+        run: dotnet test test/unit/RemoteFacade.UnitTests/RemoteFacade.UnitTests.csproj
+
+      - name: Build image for self-tests (amd64)
+        run: docker build -t remote-facade-host:citest .
+
+      - name: Self-tests
+        run: ./test/run.sh remote-facade-host:citest
+
+      # Testcontainers against the image just built. Complements test/run.sh
+      # rather than repeating it: run.sh pins the wire format with curl, this
+      # proves the CLIENT PACKAGE can drive the composition path.
+      - name: Integration tests (Testcontainers)
+        env:
+          REMOTE_FACADE_IMAGE: remote-facade-host:citest
+        run: dotnet test test/integration/RemoteFacade.IntegrationTests/RemoteFacade.IntegrationTests.csproj
+
+
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/remote-facade-host
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable=${{ !contains(github.ref, '-') }}
+
+      # Perfect atomicity across two registries isn't available, so this and the
+      # NuGet push below are kept adjacent with nothing fallible between them --
+      # everything that could fail on its own (the suite, the pack) already ran
+      # above. If the job still dies between these two steps (a registry outage,
+      # a network blip), re-running the workflow for the SAME tag is safe and
+      # completes the release: build-push-action overwrites the same tags, and
+      # `nuget push --skip-duplicate` below tolerates a version that already
+      # exists. Don't re-tag or force anything -- just re-run the workflow.
+      #
+      # The self-tests above ran on amd64 only; arm64 correctness rests on this
+      # cross-build alone and is exercised by no test.
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      # Trusted Publishing: nuget.org takes this job's OIDC token, checks it
+      # against the policy registered for this repo and workflow FILENAME
+      # (release.yml), and returns a temporary API key. No long-lived secret
+      # is stored anywhere.
+      #
+      # This step sits immediately before the push on purpose: the key is
+      # valid for one hour, so requesting it earlier in the job risks it
+      # expiring before it is used.
+      - name: Exchange the OIDC token for a nuget.org key
+        id: nuget-login
+        uses: NuGet/login@v1
+        with:
+          # The nuget.org PROFILE name, not an email address. Hardcoded rather
+          # than held as a secret: it is public on the nuget.org profile page,
+          # and a secret here would only add a setup step that can silently be
+          # forgotten.
+          user: drewlane
+
+      # nuget.org rather than GitHub Packages, deliberately. GitHub Packages
+      # requires authentication for NuGet even on a public repo, which forced
+      # every consumer -- and their editor, and their CI -- to hold a token
+      # just to restore. nuget.org needs none.
+      - name: Push the client package
+        run: |
+          dotnet nuget push "./nupkg/*.nupkg" \
+            --source "https://api.nuget.org/v3/index.json" \
+            --api-key "${{ steps.nuget-login.outputs.NUGET_API_KEY }}" --skip-duplicate

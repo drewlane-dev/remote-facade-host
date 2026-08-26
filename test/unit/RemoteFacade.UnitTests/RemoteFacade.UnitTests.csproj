@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+    <!-- xUnit v3 projects are executables hosted on Microsoft.Testing.Platform. -->
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- xunit.v3 ships no global using, so ImplicitUsings alone leaves Fact
+         and Theory unresolved. -->
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="xunit.v3" Version="3.1.0" />
+    <PackageReference Include="Microsoft.Testing.Extensions.TrxReport" Version="1.8.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The client's wire tests serve a real endpoint in-process rather than
+         faking HttpClient: For<T> builds its own client, so the only way to
+         exercise the real serialization is to give it something to talk to. -->
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\src\RemoteFacadeHost\RemoteFacadeHost.csproj" />
+    <ProjectReference Include="..\..\..\src\RemoteFacade.Client\RemoteFacade.Client.csproj" />
+  </ItemGroup>
+
+</Project>

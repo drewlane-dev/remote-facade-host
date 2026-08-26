@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../CsLib/CsLib.csproj" />
+    <ProjectReference Include="../../../src/RemoteFacade.Client/RemoteFacade.Client.csproj" />
+    <PackageReference Include="Moq" Version="4.20.72" />
+  </ItemGroup>
+</Project>

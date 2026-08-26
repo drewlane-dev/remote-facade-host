@@ -1,0 +1,53 @@
+<Project>
+
+  <!--
+    Auto-imported by NuGet when RemoteFacade.Client is referenced as a package.
+    (NuGet imports build/<PackageId>.targets by convention, so the FILE NAME
+    must stay in step with <PackageId> — renaming one silently disables the
+    other, with no error anywhere.)
+
+    Purpose: publish the libraries a test wants to host into a predictable place
+    inside the test's own output, so a fixture can find them without every
+    consumer hand-writing the same MSBuild target.
+
+    Usage in a test project:
+
+        <ItemGroup>
+          <RemoteFacadePlugin Include="..\..\src\OrderBook\OrderBook.csproj" />
+        </ItemGroup>
+
+    which produces:
+
+        $(OutDir)plugin/OrderBook/     <- OrderBook.dll plus its dependencies
+
+    Why PUBLISH and not just copy the build output: remote-facade-host loads a
+    publish folder, not a bin folder. It needs the dependency assemblies sitting
+    beside the library, because it resolves them from that directory. A plain
+    ProjectReference gives the TEST process the types but never produces such a
+    folder.
+  -->
+
+  <Target Name="PublishRemoteFacadePlugins"
+          AfterTargets="Build"
+          Condition="'@(RemoteFacadePlugin)' != ''">
+
+    <!--
+      Deliberately NO Inputs/Outputs on this target.
+
+      An earlier version keyed incrementality on the .csproj path with a stamp
+      file. That is wrong and dangerously so: editing a .cs file does not touch
+      the .csproj, so MSBuild skipped the publish and the container kept loading
+      a STALE assembly while the test process compiled against the new one.
+      Measured — the test-output DLL rebuilt while the published copy sat a
+      minute older, so tests would have passed against code that no longer
+      existed.
+
+      The inner Publish target does its own up-to-date checking, so correctness
+      costs only the MSBuild task invocation, not a real republish.
+    -->
+    <MSBuild Projects="%(RemoteFacadePlugin.Identity)"
+             Targets="Publish"
+             Properties="Configuration=$(Configuration);TargetFramework=$(TargetFramework);PublishDir=$(MSBuildProjectDirectory)\$(OutDir)plugin\%(RemoteFacadePlugin.Filename)\" />
+  </Target>
+
+</Project>

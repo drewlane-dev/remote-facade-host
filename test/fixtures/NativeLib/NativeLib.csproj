@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <!--
+      LibGit2Sharp is not incidental here. It is the package that exposed the
+      bug this fixture guards: it ships its native half under
+      runtimes/{rid}/native, and it installs its own DllImportResolver, so it
+      fails in exactly the way a plugin's native assets fail and closes off
+      the most obvious workaround at the same time.
+    -->
+    <PackageReference Include="LibGit2Sharp" Version="0.32.0" />
+  </ItemGroup>
+</Project>

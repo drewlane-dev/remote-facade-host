@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <PackageId>RemoteFacade.Client</PackageId>
+    <Description>Type-safe client for remote-facade-host. Protocol only: no test framework or container dependencies.</Description>
+    <Authors>Drew Lane</Authors>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- The one dependency this package takes on: serving callbacks means
+         hosting HTTP. A framework reference, not a package, so the package
+         stays free of any test-framework or container dependency. -->
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      Shipped so a consumer gets the plugin-publish target automatically instead
+      of hand-writing it. NuGet imports build/<PackageId>.targets by convention,
+      so the file name must track PackageId above: rename one without the other
+      and the target silently stops importing, with no error anywhere.
+
+      PackagePath must be "build" exactly, and Pack must be true — the file is
+      content shipped IN the package, not something this project compiles.
+    -->
+    <None Include="build\RemoteFacade.Client.targets" Pack="true" PackagePath="build\" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- The unit tests exercise pure helpers that are deliberately not part of
+         the public surface. Widening them to public to make them testable
+         would ship API nobody should call. -->
+    <InternalsVisibleTo Include="RemoteFacade.UnitTests" />
+  </ItemGroup>
+
+</Project>
