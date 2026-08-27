@@ -1,38 +1,69 @@
 # remote-facade-host
 
-A container image that loads any .NET assembly and exposes it over HTTP, so an
-integration test can drive **several real instances** of a library or a whole
-composition root — each in its own container, each against shared state (a
-database, an SMB share, whatever the code actually talks to) — the way a real
-deployment does.
+**Run your real code inside a container, and call it from a test.**
 
-One image serves every plugin. Nothing library-specific is baked in: you
-mount a `dotnet publish` output directory, tell the host what to construct,
-and it starts answering calls.
+Point this image at a `dotnet publish` output directory and a startup method.
+It builds your service graph and exposes it over HTTP. Your test gets a typed
+proxy and calls it like a local object.
 
-You do that with a **startup**: a static method taking an `IServiceCollection`,
-written in your own code, that registers everything the container should serve.
+The point is **several real instances at once**. Start two containers against
+the same SMB share or database, drive both from one test, and you are testing
+what actually happens in production — file locking, race conditions, stale
+caches — instead of what a mock says happens.
 
-> **v3 is a breaking change.** The single-class mode (`LIB_TYPE`) and its
-> options binding (`LIB_OPTIONS`) were removed, along with the client's
-> `RemoteFacade.For<T>(url)`. A startup is now the only way to host, and
-> `RemoteHost.At(url).GetAsync<T>()` the only way to call. Configuration that
-> used to go in `LIB_OPTIONS` belongs in the startup, which is C# and can read
-> environment variables, files, or anything else, with the real types rather
-> than through a JSON binder the host owns. Setting either removed variable to
-> a meaningful value is a fatal startup error rather than silently ignored.
->
-> **Callbacks are also out for now.** `LIB_CALLBACKS`, `CallbackHost` and
-> `CallbackProxy` — which proxied a named dependency back into the test process
-> so a Moq mock could serve it — are removed from this release. The work is
-> preserved on the `callbacks` branch and may return. Substitute dependencies
-> with `LIB_SERVICES` (a fake compiled into the plugin) in the meantime.
+```csharp
+await using var host = RemoteHost.At(containerUrl);
+var store = await host.GetAsync<IDocumentStore>();
+
+await store.WriteAsync("a.txt", "hello");   // ran in the container
+```
+
+No code generation. Your test already references the library for its
+interface, so a `DispatchProxy` implements it and the compiler checks the
+contract.
+
+> **v3 is breaking.** Single-class hosting (`LIB_TYPE`, `LIB_OPTIONS`) and the
+> client's `RemoteFacade.For<T>(url)` are gone — a startup is the only way to
+> host, `RemoteHost` the only way to call. Callbacks (`LIB_CALLBACKS`,
+> `CallbackHost`) are out for now and preserved on the `callbacks` branch; use
+> `LIB_SERVICES` to substitute a dependency meanwhile.
+
+## Quick start
+
+Write a startup — ordinary `IServiceCollection` wiring, the same as your app's:
+
+```csharp
+namespace MyApp;
+
+public static class TestStartup
+{
+    public static void Configure(IServiceCollection services)
+    {
+        services.Configure<StoreOptions>(o => o.RootPath = "/mnt/share");
+        services.AddSingleton<IDocumentStore, DocumentStore>();
+    }
+}
+```
+
+Publish it and run the image:
+
+```bash
+dotnet publish MyApp.csproj -o ./publish
+
+docker run -v "$(pwd)/publish:/plugin:ro" \
+  -e LIB_ASSEMBLY=MyApp.dll \
+  -e LIB_REGISTRAR=MyApp.TestStartup.Configure \
+  -p 8080:8080 ghcr.io/drewlane-dev/remote-facade-host:2.1.0
+```
+
+Then drive it. With [Testcontainers](https://dotnet.testcontainers.org/), the
+whole thing is a fixture — see [`test/integration`](test/integration) for a
+working one.
 
 ## How it works
 
-**Getting your code into the container.** Nothing is built into the image and
-nothing is copied at build time: the host mounts a publish output directory and
-loads it at startup.
+Nothing is baked into the image and nothing is copied at build time: the host
+mounts a publish directory and loads it at startup.
 
 ```mermaid
 flowchart LR
@@ -55,12 +86,8 @@ flowchart LR
     inst -.-> shared[("shared state<br/>SMB share, SQL, ...")]
 ```
 
-Run two containers against the same share and you have two real SMB clients
-contending for real files — which is the point.
-
-**Calling it.** `RemoteFacade.For<T>(url)` hands back a `DispatchProxy`. There
-is no generated client and no codegen step: every method on your interface
-becomes one HTTP POST, matched on the far side by name and argument count.
+Every interface method becomes one HTTP POST, matched on the far side by name
+and argument count.
 
 ```mermaid
 sequenceDiagram
@@ -82,645 +109,124 @@ sequenceDiagram
     Note over test,real: a throw comes back as { ok: false, error }<br/>and the proxy rethrows it
 ```
 
-## Composition-root hosting
-
-Point the container at a static method that wires an `IServiceCollection`
-exactly the way your application's own `Startup`/`Program.cs` does:
-
-```csharp
-namespace MyApp;
-
-public static class GraphStartup
-{
-    public static void Configure(IServiceCollection services)
-    {
-        services.AddSingleton<IDocumentStore, DocumentStore>();
-        services.AddSingleton<IRootFacade, RootFacade>();
-        // ... the rest of the app's real wiring, unchanged.
-    }
-}
-```
-
-Two environment variables point the container at it — and that's all it
-needs; configuration is the startup's own business, because there's no
-single root type to derive an `IOptions<T>` constructor parameter from. Bind
-whatever options your own startup needs the same way your app already does
-(`services.Configure<T>(...)`, `Options.Create(...)`, etc.), inside
-`Configure` itself:
-
-```
-docker run \
-  -v "$(pwd)/publish:/plugin:ro" \
-  -e LIB_DIR=/plugin -e LIB_ASSEMBLY=MyApp.dll \
-  -e LIB_REGISTRAR=MyApp.GraphStartup.Configure \
-  ... remote-facade-host
-```
-
-`LIB_REGISTRAR` is required: it is the only way to say what a container
-serves. From the test
-process, use `RemoteHost` (from the `RemoteFacade.Client` package) to resolve
-services by interface:
-
-```csharp
-using RemoteFacadeHost.Client;
-
-await using var host = RemoteHost.At("http://instance-a:8080");
-
-var facade = await host.GetAsync<IRootFacade>();
-Console.WriteLine(facade.Who());          // runs in the container
-
-await host.ResetAsync();                  // rebuilds the whole graph
-```
-
-`GetAsync<T>` round-trips to `GET /services` before returning the proxy, so a
-typo or a missing registration fails right there — naming the interface and
-listing what *is* registered — rather than later, confusingly, at the first
-method call. `RemoteHost` has no public constructor: `At(string)` is the only
-supported way to build one. That's deliberate, not an oversight —
-`DisposeAsync` unconditionally disposes the `HttpClient` it created, with no
-ownership flag, so a public constructor would let two `RemoteHost`s share a
-client and have the first one's disposal silently break the second. Verified
-by reflection in `test/fixtures/GraphClient/Program.cs`, which asserts
-`typeof(RemoteHost).GetConstructors(...)` is empty.
-
-A small helper, `RemoteHostEnvironment.For(Type, string?)`, builds the
-`LIB_ASSEMBLY`/`LIB_REGISTRAR` dictionary from the startup type itself, so a
-typo in the registrar string can't slip past the compiler:
-
-```csharp
-var env = RemoteHostEnvironment.For(typeof(GraphStartup));
-// env["LIB_ASSEMBLY"]  == "MyApp.dll"
-// env["LIB_REGISTRAR"] == "MyApp.GraphStartup.Configure"
-```
-
-It takes a `Type`, not a generic type parameter, deliberately: a startup is a
-holder for a static registration method, so it is itself almost always
-declared `static class` (as `GraphStartup` above is) — and C# refuses a
-static type as a generic type argument (`CS0718`), full stop. `typeof(X)` is
-exactly as compile-time-checked as a type argument would be — `X` must exist
-and be spelled correctly — without excluding the one shape this helper exists
-to serve. Verified against the real, `static class GraphStartup` above via
-`test/fixtures/GraphClient`, which asserts both dictionary values. The named
-method must also actually be `static`; an instance method of the right name
-is rejected here rather than failing later, confusingly, when the container
-has no instance to invoke it on.
-
-### The facade pattern
-
-A composition root's most useful services are rarely narrow value types —
-they're the real objects your app built, with real dependencies wired in by
-`Configure`. Expose those through a small facade interface that takes and
-returns simple values, and let the container keep the complex objects on its
-own side:
-
-```csharp
-public interface IRootFacade
-{
-    string Who();
-}
-```
-
-The next section explains why: an object with methods does not survive the
-trip across `/invoke` the way you might expect from an in-process call.
-
-## The boundary
-
-This is a test affordance, not an RPC framework: no auth, no retries, no
-streaming, no versioned contract.
-
-**Arguments and return values cross by value, as JSON — never by
-reference.** This is the one thing every consumer of this image needs to
-internalize before writing a facade.
-
-Measured directly against a plugin class shaped like this:
-
-```csharp
-public class Counter
-{
-    public int Count { get; set; }
-    public string Bump() { Count++; return $"bumped to {Count}"; }
-}
-
-public interface IFacade
-{
-    string Poke(Counter c);
-}
-```
-
-```csharp
-var counter = new Counter { Count = 5 };
-var result = facade.Poke(counter);   // proxy call over /invoke
-
-Console.WriteLine(result);           // "bumped to 6"
-Console.WriteLine(counter.Count);    // 5 -- unchanged
-```
-
-The container deserializes its own, brand-new `Counter` from the JSON
-`{"Count":5}`, calls `Bump()` on *that* copy, and serializes the string
-result back. The caller's `counter` was never touched — it lives in a
-different process, and the only thing that ever crossed the wire was its
-data at the moment of the call. Over raw HTTP, the same round trip looks
-like:
-
-```
-$ curl -X POST http://host:8080/invoke -H 'Content-Type: application/json' \
-    -d '{"method":"Poke","args":[{"Count":5}]}'
-{"ok":true,"result":"bumped to 6"}
-```
-
-**An interface (or abstract class) argument fails outright, loudly, before
-the method ever runs** — `System.Text.Json` has nothing to construct:
-
-```
-$ curl -X POST http://host:8080/invoke -H 'Content-Type: application/json' \
-    -d '{"method":"UseThing","args":[{}]}'
-{"ok":false,"error":"argument 's' (ISomething): Deserialization of interface
-or abstract types is not supported. Type 'MyApp.ISomething'. Path: $ |
-LineNumber: 0 | BytePositionInLine: 1."}
-```
-
-This is exactly why the facade pattern (above) matters for composition-root
-hosting: a facade method that took, say, an `IDocumentStore` argument instead
-of returning one could never be called at all. Keep complex objects —
-anything with behavior, anything the startup built through DI — on the
-container's side of the line. A facade method should take and return plain
-values (strings, numbers, records of plain values, collections of those) and
-reach into the composition root's own services internally, where the objects
-already live.
-
-Two shapes are actively **rejected** by `Invoker` before the method ever
-runs, with a message naming the method and the reason:
-
-- **`ref` / `out` / `in` parameters.** `{"ok":false,"error":"method '<name>'
-  has ref parameter '<param>'; ref/out/in parameters cannot cross /invoke"}`
-  (`out parameter` / `in parameter` for the other two kinds).
-- **Open generic methods** (e.g. `T Echo<T>(T value)`, called with no type
-  argument to close over). `{"ok":false,"error":"method '<name>' is an open
-  generic method; /invoke has no way to supply type arguments, so it cannot
-  be called"}`.
-
-Everything else is attempted rather than pre-checked: every argument and
-every return value is bound or serialized with `System.Text.Json` as it's
-needed, and a type it refuses — `System.Type`, `Stream`, an interface, an
-object cycle, and so on — fails right there, inside the same guarded path,
-with a purpose-built message naming what failed:
-
-- A bad argument: `{"ok":false,"error":"argument '<name>' (<Type>): <the
-  System.Text.Json message>"}`.
-- A bad return value: `{"ok":false,"error":"return value of '<method>'
-  (<Type>): <the System.Text.Json message>"}` — for example, a method
-  declared to return `System.Type` produces `{"ok":false,"error":"return
-  value of 'BadReturn' (Type): Serialization and deserialization of
-  'System.RuntimeType' instances is not supported. Path: $."}`.
-
-A failure *before* the method — resolving the service a call names — is
-enveloped the same way. `Resolve`'s own misses (not a type in the assembly,
-not registered, registered `Scoped`) go out verbatim, since they already name
-the service and list what is registered. Anything else out of the container is
-the plugin's own code throwing, almost always a service **constructor**, and
-is attributed to the service it came from:
-
-```
-{"ok":false,"error":"cannot resolve service 'MyApp.IThing': ArgumentException:
-wiring is wrong: no connection string"}
-```
-
-None of these ever reaches the caller as a bare HTTP 500 with an empty body.
-
-## `Scoped` services
-
-`GraphStartup.Configure` may register a service `AddScoped` — a real ASP.NET
-Core `IServiceCollection` accepts it — but **a remote call has no scope for
-it to live in**, and it is rejected. The important, measured detail is
-*when*:
-
-- **`GET /services` still lists it.** The endpoint reports every registered
-  service type name; it doesn't filter by lifetime.
-- **`RemoteHost.GetAsync<T>()` still succeeds.** Its registration check only
-  inspects `GET /services`, and a Scoped registration passes that check.
-- **The rejection happens on the first actual method call**, inside
-  `HostedGraph.Resolve`, which `/invoke` consults per call:
-
-```
-$ curl -X POST http://host:8080/invoke -H 'Content-Type: application/json' \
-    -d '{"service":"CsLib.IScopedThing","method":"Say","args":[]}'
-{"ok":false,"error":"service 'CsLib.IScopedThing' is registered Scoped, and a
-remote call has no scope to live in. Register it Singleton or Transient, or
-resolve it inside a method on a service that is."}
-```
-
-Confirmed end-to-end against a real `RemoteHost`-driven proxy
-(`test/fixtures/GraphClient`): `GetAsync<IScopedThing>()` returns
-successfully, and the exception above only surfaces once a method is called
-on the resulting proxy.
-
-**Two shapes escape this guard**, and the limit is worth knowing because the
-result is a service quietly served from the root container rather than an
-error. An **open-generic** scoped registration (`services.AddScoped(typeof(
-IRepo<>), typeof(Repo<>))`) is keyed on the open type name, while `/invoke`
-names the closed one, so the two never match and the call is served. A
-**captive dependency** — a `Singleton` whose constructor takes a `Scoped`
-service — is served too, capturing that scoped instance for the container's
-lifetime; the guard is about the *directly named* service, and
-`BuildServiceProvider()` is called without `ValidateScopes`. Both fail safe
-(a singleton-lifetime instance, not corruption) and both are known,
-deliberately deferred limits rather than oversights.
-
-If a service registered both `AddScoped` and `AddSingleton` for the same
-interface (without `Replace`), rejection follows whichever registration
-actually **wins** resolution — the last one registered, which is how .NET's
-own container resolves it — not "any matching descriptor is Scoped." A
-singleton registered after a scoped one for the same interface is served
-normally.
-
-## Security
-
-**`/invoke` executes arbitrary methods on whatever assembly is loaded, with
-whatever arguments the caller sends.** There is no auth, no allowlist, no
-sandboxing beyond the container boundary. This image is for test networks
-only — never expose it to anything you don't fully trust.
-
 ## Configuration
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `LIB_DIR` | `/plugin` | Directory containing the plugin's `dotnet publish` output. |
-| `LIB_ASSEMBLY` | *(required)* | Assembly file name inside `LIB_DIR`, e.g. `CsLib.dll`. |
-| `LIB_SERVICES` | `{}` | JSON map of interface name to implementing type name, both resolved from the plugin assembly — see [Substituting a dependency](#substituting-a-dependency). |
-| `LIB_REGISTRAR` | **required** | `Namespace.Type.Method` naming a static method that takes an `IServiceCollection`. This is how a container is told what to serve. Runs *before* `LIB_SERVICES`, so the explicit map can still override anything it registers. Unset is a fatal startup error. |
-| `LIB_PORT` | `8080` | HTTP port the host listens on. |
-| `SMB_SERVER` | unset | SMB server to mount before serving. Must be set together with `SMB_SHARE`. |
-| `SMB_SHARE` | unset | Share name. |
-| `SMB_USER` | `azure` | Mount credential. |
-| `SMB_PASS` | `Passw0rd!` | Mount credential. |
-| `SMB_MOUNT_POINT` | `/mnt/share` | Where the share is mounted. |
-| `SMB_MOUNT_OPTIONS` | `vers=3.1.1,uid=0,gid=0,file_mode=0777,dir_mode=0777,serverino,nosharesock,actimeo=30,mfsymlinks,seal` | Passed to `mount -t cifs` as `-o`. |
+| `LIB_ASSEMBLY` | **required** | Assembly file name inside `LIB_DIR`, e.g. `MyApp.dll`. |
+| `LIB_REGISTRAR` | **required** | `Namespace.Type.Method` — a static method taking an `IServiceCollection`. Unset is a fatal startup error. |
+| `LIB_DIR` | `/plugin` | Directory containing the publish output. |
+| `LIB_SERVICES` | `{}` | Interface-to-implementation overrides, applied *after* the startup. See below. |
+| `LIB_PORT` | `8080` | Port to listen on. |
 
-Mounting is entirely optional — a library that talks to, say, a SQL database
-needs no share at all, and a host serving it needs no elevated capabilities.
-It only activates when `SMB_SERVER` and `SMB_SHARE` are **both** set (setting
-only one is a fatal startup error, not a silent no-op, since a library that
-expects a mount and silently doesn't get one would write to the container's
-own filesystem instead — passing tests while proving nothing). When it does
-activate, the container needs `CAP_SYS_ADMIN` and `CAP_DAC_READ_SEARCH`, plus
-(at least under Docker's default AppArmor profile) `--security-opt
-apparmor=unconfined`:
+### Mounting an SMB share
 
-```
+Optional, and off unless `SMB_SERVER` **and** `SMB_SHARE` are both set —
+setting only one is a fatal error, not a silent no-op, because a library that
+expected a mount and didn't get one would write to the container's own disk
+and pass tests while proving nothing.
+
+| Variable | Default |
+|---|---|
+| `SMB_SERVER`, `SMB_SHARE` | unset |
+| `SMB_USER`, `SMB_PASS` | `azure` / `Passw0rd!` |
+| `SMB_MOUNT_POINT` | `/mnt/share` |
+| `SMB_MOUNT_OPTIONS` | `vers=3.1.1,uid=0,gid=0,file_mode=0777,dir_mode=0777,serverino,nosharesock,actimeo=30,mfsymlinks,seal` |
+
+Mounting needs extra capabilities:
+
+```bash
 docker run --cap-add SYS_ADMIN --cap-add DAC_READ_SEARCH \
   --security-opt apparmor=unconfined \
-  -e SMB_SERVER=samba -e SMB_SHARE=data \
-  ...
+  -e SMB_SERVER=samba -e SMB_SHARE=data ...
 ```
 
 ## HTTP API
 
-Bodies below were captured from real containers: `CsLib.Store` (the `IStore`
-fixture under `test/fixtures/CsLib`, single-instance mode) for `/health`,
-`/types` and the base `/invoke` shape, and `CsLib.GraphStartup` (composition
-root, `LIB_REGISTRAR=CsLib.GraphStartup.Configure`) for
-`/services` and the `service`-qualified `/invoke` shape.
+`RemoteHost` speaks this for you; it is here for when you need to look.
 
-### `GET /health`
+| | |
+|---|---|
+| `GET /health` | `{"registrar":"MyApp.TestStartup.Configure"}` once serving. |
+| `GET /services` | Every registered service type name. |
+| `GET /types` | Every public type in the assembly — for when a name is wrong. |
+| `POST /invoke` | `{"service","method","args"}` → `{"ok":true,"result":…}` or `{"ok":false,"error":"…"}`. |
+| `DELETE /instance` | Rebuilds the graph, discarding all state. Returns 204. |
 
-```
-$ curl http://host:8080/health
-{"type":"CsLib.Store"}
-```
+**Errors never arrive as a bare 500 with an empty body.** A method that throws,
+an argument that will not deserialize, a service that is not registered — all
+come back as `{"ok":false,"error":…}` naming the cause. A missing service
+lists what *is* registered.
 
-Returns the constructed type's full name — `null` in composition-root mode,
-where nothing is constructed up front. A 200 here means the host is ready to
-serve `/invoke`.
-
-### `GET /types`
-
-```
-$ curl http://host:8080/types
-["CsLib.IStamp","CsLib.RealStamp","CsLib.FakeStamp","CsLib.Inner","CsLib.FakeInner",
- "CsLib.Outer","CsLib.Configured","CsLib.ConfiguredFromFactory","CsLib.NeedsConfigured",
- "CsLib.Registration","CsLib.IStore","CsLib.StoreOptions","CsLib.Store"]
-```
-
-Every public type the loaded assembly actually exports. This exists because a
-wrong service or registrar name is otherwise a dead end — see [the VB note](#a-note-for-vb-libraries)
-below for the case that motivated it.
-
-### `GET /services`
-
-```
-$ curl http://croot:8080/services
-["Microsoft.Extensions.Options.IOptions`1","Microsoft.Extensions.Options.IOptionsSnapshot`1",
- "Microsoft.Extensions.Options.IOptionsMonitor`1","Microsoft.Extensions.Options.IOptionsFactory`1",
- "Microsoft.Extensions.Options.IOptionsMonitorCache`1","Microsoft.Extensions.Logging.ILoggerFactory",
- "Microsoft.Extensions.Logging.ILogger`1",
- "Microsoft.Extensions.Options.IConfigureOptions`1[[Microsoft.Extensions.Logging.LoggerFilterOptions, ...]]",
- "CsLib.StringRooted","CsLib.IRootFacade","CsLib.IScopedThing","CsLib.IExplicitThing",
- "CsLib.IScopedThenSingleton","CsLib.ICounter"]
-```
-
-The full names of every registered service type — **exactly what
-`GraphStartup.Configure` (plus `AddLogging()`, which the host always calls)
-put in the container, framework internals included, not a curated list of
-just your own interfaces.** Expect noise from the DI/logging/options
-machinery ahead of your own types, as above. This is the list
-`RemoteHost.GetAsync<T>()` checks membership against, and it includes
-`Scoped` registrations — see [`Scoped` services](#scoped-services) for why
-that doesn't mean a `Scoped` service is actually callable.
-
-### `POST /invoke`
-
-```
-$ curl -X POST http://host:8080/invoke -H 'Content-Type: application/json' \
-    -d '{"method":"ReadAsync","args":["doc.json"]}'
-{"ok":true,"result":"hello world"}
-
-$ curl -X POST http://host:8080/invoke -H 'Content-Type: application/json' \
-    -d '{"method":"FailAsync","args":[]}'
-{"ok":false,"error":"deliberate failure for the async-exception test"}
-
-$ curl -X POST http://host:8080/invoke -H 'Content-Type: application/json' \
-    -d '{"method":"Nope","args":[]}'
-{"ok":false,"error":"no method 'Nope' taking 0 argument(s)"}
-```
-
-Calls a method by name, matching by name and argument count. Arguments are
-JSON, deserialized into the method's parameter types; the result — whatever
-the return value is — comes back as `result`. `void`, `Task`, `T`, and
-`Task<T>` all round-trip; the client and host negotiate no other shape. A
-thrown exception (sync or from a faulted `Task`) comes back as
-`{"ok":false,"error":"<the exception's own Message>"}` instead of an
-unhandled 500.
-
-There is no single instance to
-dispatch against, so the request must name which registered service it
-wants, via a `service` field carrying the service's full type name:
-
-```
-$ curl -X POST http://croot:8080/invoke -H 'Content-Type: application/json' \
-    -d '{"service":"CsLib.IRootFacade","method":"Who","args":[]}'
-{"ok":true,"result":"root-facade"}
-
-$ curl -X POST http://croot:8080/invoke -H 'Content-Type: application/json' \
-    -d '{"method":"Who","args":[]}'
-{"ok":false,"error":"every call must name the service it wants in the
-call must name the service it wants in the \"service\" field."}
-```
-
-An unregistered or unknown `service` names itself and lists what *is*
-registered:
-
-```
-$ curl -X POST http://croot:8080/invoke -H 'Content-Type: application/json' \
-    -d '{"service":"CsLib.IStamp","method":"Value","args":[]}'
-{"ok":false,"error":"service 'CsLib.IStamp' is not registered. Registered
-services: Microsoft.Extensions.Options.IOptions`1, ..., CsLib.IRootFacade,
-CsLib.IScopedThing, CsLib.IExplicitThing, CsLib.IScopedThenSingleton,
-CsLib.ICounter"}
-```
-
-`RemoteFacade.For<T>` (single-instance mode) never sends a `service` field —
-its wire format is pinned byte-for-byte against the original single-instance
-protocol. `RemoteHost.GetAsync<T>()` (composition-root mode) always sends
-one, resolved from the interface `T` was asked for.
-
-### `DELETE /instance`
-
-```
-$ curl -i -X DELETE http://host:8080/instance
-HTTP/1.1 204 No Content
-```
-
-**Rebuilds the entire graph** — not just the root instance, but the whole DI
-provider and every singleton in it — from the same configuration, then
-serves every later call against the new one. In single-instance mode this
-was already true of the one constructed object; in composition-root mode it
-means *every* registered singleton is new, which is the only way to actually
-observe a rebuild happened rather than a plain re-resolve: a singleton
-counter that reached 2 within one graph reads 1 again immediately after
-reset.
-
-It does **not** reset anything written outside the process — a file already
-written to a mounted share stays written. Only object identity and in-memory
-state inside the container are new.
-
-**Safe against calls already in flight, measured directly.** A reset retires
-the current graph and publishes a fresh one immediately; a call already
-running against the old graph keeps running against it — the old graph is
-disposed only once its last in-flight call finishes, never out from under
-one. Before this guarantee existed, two calls in flight across one `DELETE
-/instance` both came back
-`{"ok":false,"error":"Cannot access a disposed object. Object name:
-'IServiceProvider'."}` — an error attributed to nothing the caller did,
-arriving on a call it had already made.
-
-**An instance-registered root is deliberately not disposed on reset.** If a
-composition root registers a ready-made object —
-`services.AddSingleton<Root>(existingInstance)` — rather than a type or a
-factory, `DELETE /instance` does **not** call `Dispose()` on it, even if it's
-`IDisposable`. This follows .NET's own rule for its container: a provider
-disposes what it *created*; an instance it was merely handed is not
-something it created, so it isn't tracked for disposal — same as in any
-ordinary ASP.NET Core app. Confirmed by running exactly this shape end to
-end: `DELETE /instance` returns `204`, and the disposal sentinel the plugin's
-`Dispose()` would have written never appears. If a reset needs to release
-whatever a root holds, register it as a type (`services.AddSingleton<Root>()`)
-or a factory instead — either is provider-owned and gets disposed normally.
-
-**A plugin `Dispose()` that throws** is handled differently depending on
-whether anything is still in flight when it runs. On the deferred path — the
-retired graph's last in-flight call is the one that ends up disposing it —
-the throw is caught and written to the container's own stderr, never
-propagated: that caller's request had already succeeded, and letting the
-throw unwind would turn a successful response into an empty 500 for a call
-that had nothing to do with the failure. Confirmed on the other path too:
-with nothing in flight, `Reset()` disposes synchronously on the `DELETE`
-request itself and does **not** swallow — the response is `500`, because the
-operator who asked for the reset is the one who should be told their
-plugin's `Dispose()` is broken.
-
-**A non-204 from `DELETE /instance` does not mean the reset failed.** The
-swap happens first, inside the lock; the retired graph is disposed afterwards,
-outside it. So a `500` here reports a failure *during teardown of the old
-graph* — the new graph is already built, already published, and already
-serving. A fixture that treats `ResetAsync()` throwing as "the reset didn't
-happen, abort" is drawing the wrong conclusion, and one that retries will
-reset twice.
+Every awaitable shape works: `Task`, `Task<T>`, `ValueTask`, `ValueTask<T>`,
+and plain synchronous returns. An async method hands its `Task` back before
+the round trip completes, so `Task.WhenAll(a.X(), b.X())` really does overlap
+two containers.
 
 ## Substituting a dependency
 
-Two mechanisms exist because a **fake** and a **mock** live in different
-places, and only one of those places is reachable from a container.
-
-**`LIB_SERVICES` — a fake, compiled into the plugin assembly.**
+`LIB_SERVICES` maps an interface to an implementation, both resolved from the
+plugin assembly, applied *after* your startup runs:
 
 ```
-LIB_SERVICES={"CsLib.IStamp":"CsLib.FakeStamp"}
+-e LIB_SERVICES='{"MyApp.IClock":"MyApp.Testing.FixedClock"}'
 ```
 
-Both names are resolved from the loaded plugin assembly. Zero infrastructure,
-no network hop, behavior fixed at compile time — the right choice when the
-substitute is simple and the same across tests. `LIB_REGISTRAR` names a
-static method (`Namespace.Type.Method` form, taking a single
-`IServiceCollection`) for wiring the env-var map can't express — an
-extension method like `services.AddCsLib()` works unchanged, since an
-extension method is just a static method on a static class. `LIB_REGISTRAR`
-runs *first*, so `LIB_SERVICES` can still override individual entries from
-it, and auto-registration of concrete types checks the service collection
-first so it never clobbers what the registrar (or `LIB_SERVICES`) already
-wired.
+Real wiring, one thing faked — without the plugin knowing it is under test.
+The fake must be a type in the plugin assembly.
 
-## A note for VB libraries
+## Things worth knowing
 
-VB **prepends** the project's `RootNamespace` to every declared namespace,
-unlike C# where a file's `namespace` is absolute. A VB library's real,
-fully-qualified type name is therefore often not what a C# developer would
-guess — a class declared as `Namespace VbLib ... Class VbStore` in a project
-whose `RootNamespace` is left at its default (the project name) is not
-`VbLib.VbStore`, it's `VbLib.VbLib.VbStore`. Point `LIB_REGISTRAR` at the wrong one
-and the host fails at startup with:
+**`Scoped` registrations are refused.** A remote call has no scope to live in.
+The error says so and names the service. Register it `Singleton` or
+`Transient`, or resolve it inside a method on something that is.
 
-```
-LIB_REGISTRAR names type '<name>', which is not in the assembly. Available: <every exported type, comma-separated>
-```
+**One graph per container, for its lifetime.** That is what lets one call take
+a lock and a later call release it. `DELETE /instance` resets between tests;
+proxies you already hold keep working, because services resolve per call.
 
-`GET /types` lists what the assembly actually contains, which is the fastest
-way out of that dead end.
+**Native dependencies just work.** A plugin carrying `runtimes/<rid>/native`
+(LibGit2Sharp, SkiaSharp, SQLitePCLRaw) loads with no configuration — no
+`LD_LIBRARY_PATH`, no knowing the image's RID. The image is Alpine, so the RID
+is `linux-musl-*`; a package shipping only `linux-x64` will not load, and the
+error says so, naming the library and every directory searched.
 
-## Load context
+**Host and plugin share a load context.** So `typeof(IOptions<>)` means the
+same thing on both sides and constructor matching works. The cost: you must
+agree on versions of shared packages (`Microsoft.Extensions.*`). A mismatch
+shows up as a confusing "no constructor found".
 
-The host loads the plugin assembly into the **default** `AssemblyLoadContext`
-— not an isolated one — so the host's `typeof(IOptions<>)` and the plugin's
-are the *same* type identity, and constructor matching just works. The cost
-of that choice is that **host and plugin must agree on the versions of any
-package they share** (`Microsoft.Extensions.Options`,
-`Microsoft.Extensions.Logging.Abstractions`,
-`Microsoft.Extensions.DependencyInjection`, etc.) — a mismatch surfaces as a
-confusing "no constructor found" rather than a version-conflict error.
-
-## Native dependencies
-
-Plugins that carry native assets — LibGit2Sharp, SkiaSharp, SQLitePCLRaw,
-anything with a `runtimes/<rid>/native` folder — work with **no extra
-configuration**. Reference the package, publish the plugin normally, and call
-it.
-
-Nothing needs to be set for this. In particular you do **not** need to set
-`LD_LIBRARY_PATH` on the container or know which RID the image is built for.
-
-<details>
-<summary>Why this needed fixing, and what the host does</summary>
-
-The process starts as `RemoteFacadeHost.dll`, so the CLR builds its native
-search list from the **host's** `.deps.json`, once, at startup. A plugin
-arriving later via `Assembly.LoadFrom` contributes nothing to that list, so
-the `runtimes/<rid>/native` directory sitting beside the plugin is never
-probed. LibGit2Sharp would die in its type initializer the first time
-anything touched a repository.
-
-The host closes this two ways, because they cover different failures:
-
-- **`NativeResolver`** subscribes to
-  `AssemblyLoadContext.Default.ResolvingUnmanagedDll` and probes the plugin's
-  `runtimes/<rid>/native`. It is a multicast event, so it does not collide
-  with the `DllImportResolver` LibGit2Sharp installs for itself, and it fires
-  only after normal probing has already failed, so it cannot mask a library
-  that would have loaded anyway.
-- **The entrypoint script** puts those same directories on `LD_LIBRARY_PATH`
-  before the host starts. This is for the case no managed hook can see — one
-  native library `dlopen`ing a sibling without passing through the CLR — and
-  it has to happen before process start, because the dynamic loader reads
-  that variable exactly once.
-
-If a native library still cannot be found, the error names it, the host's
-RID, and every directory searched:
-
-```
-[native library 'git2-5853918' could not be loaded: host rid=linux-musl-arm64;
- searched /plugin. The plugin needs a build carrying native assets for
- linux-musl-arm64.]
-```
-
-Note the RID: the image is Alpine, so it is `linux-musl-*`. Most packages
-ship musl builds, but a package that ships only `linux-x64` will not load
-here.
-
-</details>
+**VB libraries work unchanged.** A `Public Module` gives you the static
+`Configure` the host needs. Watch the names: VB *prepends* `RootNamespace` to
+declared namespaces, so your type may be `VbLib.VbLib.VbStore`. `GET /types`
+will tell you.
 
 ## Testing this image
 
-`test/run.sh <image-tag>` runs the self-test suite against real containers —
-constructing types (both modes), all four return shapes, instance reset,
-composition-root resolution and its failure modes, a two-container
-share-mounted scenario, `LIB_SERVICES`/`LIB_REGISTRAR`
-wiring, and the startup failure modes documented above:
+Three suites, deliberately not interchangeable:
 
 ```bash
-docker build -t remote-facade-host:dev .
-./test/run.sh remote-facade-host:dev
-```
-
-Two .NET suites sit alongside it, and the three are deliberately not
-interchangeable:
-
-```bash
-# Logic. No Docker, runs in under a second.
 dotnet test test/unit/RemoteFacade.UnitTests/RemoteFacade.UnitTests.csproj
 
-# The client package driving the real image, via Testcontainers.
+docker build -t remote-facade-host:dev .
+./test/run.sh remote-facade-host:dev
 dotnet test test/integration/RemoteFacade.IntegrationTests/RemoteFacade.IntegrationTests.csproj
 ```
 
-| Suite | Covers | Why it cannot be one of the others |
+| Suite | Covers | Why it can't be one of the others |
 |---|---|---|
+| unit | logic — `InstanceHolder`, `Invoker`, `NativeResolver`, the client | Reset-during-a-call and racing resets can't be timed reliably over HTTP; a test that hopes the interleaving lands proves nothing when it passes. |
 | `test/run.sh` | the wire, with `curl` | Only a byte comparison against the previous release catches a dropped field. |
-| unit | `InstanceHolder`, `Invoker`, `NativeResolver`, `HostedGraph`, the client | Reset-during-a-call and racing resets cannot be timed reliably over HTTP; a test that hopes the interleaving lands proves nothing when it passes. |
-| integration | the composition path, through `RemoteHost` | `run.sh` speaks the protocol with `curl`, so it never exercises the client package a consumer actually depends on. |
+| integration | the composition path through `RemoteHost` | `run.sh` speaks the protocol with `curl`, so it never exercises the client package consumers depend on. |
 
-The integration suite honours `REMOTE_FACADE_IMAGE` so CI can point it at the
-tag it just built, and defaults to `remote-facade-host:dev` rather than a
-published tag: a silent fallback to `:latest` would validate a different
-artifact than the one about to ship.
+`test/baseline.sh` compares `/invoke` responses byte-for-byte against the
+published `2.1.0` image. The integration suite honours `REMOTE_FACADE_IMAGE`
+so CI can point it at the tag it just built.
 
 ## Releasing
 
-`.github/workflows/release.yml` publishes both halves of the wire protocol —
-the `ghcr.io/<owner>/remote-facade-host` multi-arch image and the
-[`RemoteFacade.Client`](https://www.nuget.org/packages/RemoteFacade.Client)
-NuGet package on nuget.org — from a single `vMAJOR.MINOR.PATCH` (or
-`vMAJOR.MINOR.PATCH-prerelease`, e.g. `v1.2.3-rc1`) tag pushed to `main`. The
-first job step rejects any tag that isn't well-formed semver, so a typo like
-`vfoo` fails immediately instead of silently overwriting the `latest` image
-tag. The self-test suite must pass for the tagged commit before either
-publish step runs.
-
-Perfect atomicity across two registries isn't achievable, but the window for
-a partial release is kept as small as possible: all local, fallible work
-(the suite, packing the client) happens before either push, and the two
-pushes themselves run back-to-back with nothing fallible between them. If
-the workflow still dies between the image push and the NuGet push — a
-registry outage, a network blip — **re-running the workflow for the same tag
-is safe and completes the release.** Both pushes are idempotent:
-`docker/build-push-action` overwrites the same image tags, and
-`dotnet nuget push --skip-duplicate` tolerates a package version that
-already exists. Don't delete or re-create the tag — just re-run the job.
-
-The client goes to **nuget.org**, not GitHub Packages, and the difference is
-not cosmetic. GitHub Packages requires authentication for NuGet restore even
-when the source repository is public, so every consumer — and their editor,
-and their CI — needs a token with `read:packages` merely to restore. That tax
-falls on the consumer's whole project, not just the part using this package.
-nuget.org needs nothing.
-
-Publishing uses [Trusted Publishing](https://learn.microsoft.com/nuget/nuget-org/trusted-publishing):
-the job requests a GitHub OIDC token, nuget.org validates it against a policy
-registered for this repository and this workflow **filename**, and returns an
-API key valid for one hour. No long-lived key is stored in this repository.
-
-Two consequences worth knowing before editing this file:
-
-- **Renaming `release.yml` breaks publishing.** The trusted publishing policy
-  names the workflow file, so a rename silently invalidates it until the
-  policy is updated on nuget.org.
-- **The login step must stay immediately before the push.** The key expires
-  after an hour; moving the exchange earlier in the job risks it expiring
-  before it is used.
+Push a `v*` tag. [`release.yml`](.github/workflows/release.yml) runs all three
+suites, then publishes the multi-arch image to GHCR and `RemoteFacade.Client`
+to nuget.org via Trusted Publishing. The client and the image are two halves
+of one wire protocol, so they carry the same version and ship from the same
+tag.
