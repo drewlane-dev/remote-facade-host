@@ -26,6 +26,7 @@
       published copy this test mounts.
     -->
     <ProjectReference Include="..\..\..\src\RemoteFacade.Client\RemoteFacade.Client.csproj" />
+    <ProjectReference Include="..\..\..\src\RemoteFacade.Testcontainers\RemoteFacade.Testcontainers.csproj" />
     <ProjectReference Include="..\..\fixtures\CsLib\CsLib.csproj" />
   </ItemGroup>
 

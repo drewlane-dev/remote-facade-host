@@ -163,6 +163,37 @@ and plain synchronous returns. An async method hands its `Task` back before
 the round trip completes, so `Task.WhenAll(a.X(), b.X())` really does overlap
 two containers.
 
+## Testcontainers helpers
+
+`RemoteFacade.Testcontainers` collapses the container setup into a few calls.
+It is a **separate package** so `RemoteFacade.Client` stays free of any
+container dependency — install it only if you drive containers with
+Testcontainers.
+
+```csharp
+await using var container = new ContainerBuilder()
+    .WithImage("ghcr.io/drewlane-dev/remote-facade-host:3.0.0")
+    .WithRemoteFacade(typeof(TestStartup), pluginDir)
+    .WithOptions(new StoreOptions { RootPath = "/mnt/share" })
+    .WithSmbMount(new SmbMount { Server = "samba", Share = "data" })
+    .Build();
+
+await container.StartAsync();
+await using var host = container.RemoteHost();
+```
+
+| | |
+|---|---|
+| `WithRemoteFacade` | Bind mount, `LIB_DIR`, `LIB_ASSEMBLY`, `LIB_REGISTRAR`, a random port binding, and a wait on `/health` — not on the port, which is bound before the graph is built. Throws if the plugin directory does not exist, since a missing one bind-mounts as an empty one. |
+| `WithOptions` | The same typed push-down as above, straight onto the builder. |
+| `WithSmbMount` | Credentials plus the privileges a cifs mount needs: `SYS_ADMIN`, `DAC_READ_SEARCH`, and `apparmor=unconfined`. Without them the mount fails with a message that mentions none of them. |
+| `RemoteHost()` | A client on the **mapped** port, so there is no hostname/port string to get subtly wrong. |
+
+> If you want the plugin-publish MSBuild target, reference **`RemoteFacade.Client`
+> directly too**. NuGet does not flow build assets through a transitive
+> dependency, so referencing only this package leaves the target silently
+> unimported.
+
 ## Pushing config into the container
 
 Options travel as environment variables, written from a typed object and bound

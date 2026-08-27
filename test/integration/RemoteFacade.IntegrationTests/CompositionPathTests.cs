@@ -13,7 +13,7 @@ public class CompositionPathTests(HostFixture fixture) : IClassFixture<HostFixtu
     [Fact]
     public async Task A_registered_facade_is_reachable_through_the_typed_client()
     {
-        await using var host = RemoteHost.At(fixture.Url);
+        var host = fixture.Host;
 
         var facade = await host.GetAsync<IRootFacade>();
 
@@ -28,7 +28,7 @@ public class CompositionPathTests(HostFixture fixture) : IClassFixture<HostFixtu
         // Type.GetMethods() on an interface returns only what that interface
         // itself declares, so FromBase() was once unreachable while
         // FromDerived() worked.
-        await using var host = RemoteHost.At(fixture.Url);
+        var host = fixture.Host;
 
         var facade = await host.GetAsync<IDerivedFacade>();
 
@@ -39,7 +39,7 @@ public class CompositionPathTests(HostFixture fixture) : IClassFixture<HostFixtu
     [Fact]
     public async Task ResetAsync_rebuilds_the_graph_and_existing_proxies_keep_working()
     {
-        await using var host = RemoteHost.At(fixture.Url);
+        var host = fixture.Host;
         var counter = await host.GetAsync<ICounter>();
 
         Assert.Equal(1, counter.Next());
@@ -56,7 +56,7 @@ public class CompositionPathTests(HostFixture fixture) : IClassFixture<HostFixtu
     [Fact]
     public async Task A_Scoped_registration_resolves_as_a_service_but_is_refused_at_the_CALL()
     {
-        await using var host = RemoteHost.At(fixture.Url);
+        var host = fixture.Host;
 
         // GetAsync only consults the registration list, and IScopedThing IS
         // registered -- so this must succeed.
@@ -72,7 +72,7 @@ public class CompositionPathTests(HostFixture fixture) : IClassFixture<HostFixtu
     [Fact]
     public async Task Asking_for_something_the_startup_never_registered_fails_with_the_list()
     {
-        await using var host = RemoteHost.At(fixture.Url);
+        var host = fixture.Host;
 
         var ex = await Assert.ThrowsAnyAsync<Exception>(() => host.GetAsync<IStore>());
 
@@ -97,8 +97,10 @@ public class TwoInstanceTests
 
         await Task.WhenAll(a.StartAsync(), b.StartAsync());
 
-        await using var hostA = RemoteHost.At($"http://{a.Hostname}:{a.GetMappedPublicPort(8080)}");
-        await using var hostB = RemoteHost.At($"http://{b.Hostname}:{b.GetMappedPublicPort(8080)}");
+        // RemoteHost() resolves the MAPPED port. Interpolating 8080 by hand
+        // reaches the container's own port, not the one published to the host.
+        await using var hostA = a.RemoteHost();
+        await using var hostB = b.RemoteHost();
 
         var counterA = await hostA.GetAsync<ICounter>();
         var counterB = await hostB.GetAsync<ICounter>();

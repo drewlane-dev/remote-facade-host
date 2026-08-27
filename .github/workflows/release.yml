@@ -64,7 +64,8 @@ jobs:
 
       # The client is the other half of the same wire protocol, so it carries the
       # same version and ships from the same tag. Drift between them would be a
-      # protocol mismatch nobody could diagnose from either side alone.
+      # protocol mismatch nobody could diagnose from either side alone. The
+      # Testcontainers package ships alongside for the same reason.
       #
       # This runs BEFORE the self-tests, not merely before the pushes, and the
       # ordering is load-bearing twice over:
@@ -76,10 +77,15 @@ jobs:
       #      root-owned obj/ directories in this project's source tree. A pack
       #      attempted after that fails with "Access to the path ... is denied",
       #      which is how v1.0.0's first release attempt died.
-      - name: Pack the client
+      - name: Pack the packages
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           dotnet pack src/RemoteFacade.Client/RemoteFacade.Client.csproj \
+            -c Release -p:Version="$VERSION" -o ./nupkg
+          # Same version, same tag. RemoteFacade.Testcontainers depends on the
+          # client by ProjectReference, so a version skew between them would
+          # publish a package whose dependency does not exist yet.
+          dotnet pack src/RemoteFacade.Testcontainers/RemoteFacade.Testcontainers.csproj \
             -c Release -p:Version="$VERSION" -o ./nupkg
 
       # This is a separate `docker build` from the multi-arch push later in this
@@ -169,7 +175,7 @@ jobs:
       # requires authentication for NuGet even on a public repo, which forced
       # every consumer -- and their editor, and their CI -- to hold a token
       # just to restore. nuget.org needs none.
-      - name: Push the client package
+      - name: Push the packages
         run: |
           dotnet nuget push "./nupkg/*.nupkg" \
             --source "https://api.nuget.org/v3/index.json" \
