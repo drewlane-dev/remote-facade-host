@@ -53,7 +53,7 @@ dotnet publish MyApp.csproj -o ./publish
 docker run -v "$(pwd)/publish:/plugin:ro" \
   -e LIB_ASSEMBLY=MyApp.dll \
   -e LIB_REGISTRAR=MyApp.TestStartup.Configure \
-  -p 8080:8080 ghcr.io/drewlane-dev/remote-facade-host:2.1.0
+  -p 8080:8080 ghcr.io/drewlane-dev/remote-facade-host:3.0.0
 ```
 
 Then drive it. With [Testcontainers](https://dotnet.testcontainers.org/), the
@@ -220,7 +220,8 @@ dotnet test test/integration/RemoteFacade.IntegrationTests/RemoteFacade.Integrat
 | integration | the composition path through `RemoteHost` | `run.sh` speaks the protocol with `curl`, so it never exercises the client package consumers depend on. |
 
 `test/baseline.sh` compares `/invoke` responses byte-for-byte against the
-published `2.1.0` image. The integration suite honours `REMOTE_FACADE_IMAGE`
+published `2.1.0` image — the last release that speaks both configurations,
+and so the only one a v3 host can be compared against. The integration suite honours `REMOTE_FACADE_IMAGE`
 so CI can point it at the tag it just built.
 
 ## Releasing
