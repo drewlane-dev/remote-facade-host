@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <PackageId>RemoteFacade.Testcontainers</PackageId>
+    <Description>Testcontainers extensions for remote-facade-host. Separate from RemoteFacade.Client so the protocol package stays free of any container dependency.</Description>
+    <Authors>Drew Lane</Authors>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!--
+      The reason this is a package of its own. RemoteFacade.Client advertises
+      "no test framework or container dependencies" on nuget.org, and adding
+      this reference to it would make that false AND pin every consumer to a
+      Testcontainers major, including anyone driving containers with compose,
+      Aspire or the CLI. Confining the pin to people who opted in is the whole
+      point of the split.
+    -->
+    <PackageReference Include="Testcontainers" Version="4.6.0" />
+    <!--
+      NOTE for consumers: NuGet does not flow BUILD assets through a transitive
+      dependency, and that is not overridable from here (IncludeAssets=all on
+      this reference was tried; the packed nuspec still says
+      exclude="Build,Analyzers"). So a project referencing ONLY this package
+      does not get RemoteFacade.Client.targets, and the plugin-publish target
+      silently never runs. Reference RemoteFacade.Client directly as well if
+      you want it.
+    -->
+    <ProjectReference Include="..\RemoteFacade.Client\RemoteFacade.Client.csproj" />
+  </ItemGroup>
+
+</Project>

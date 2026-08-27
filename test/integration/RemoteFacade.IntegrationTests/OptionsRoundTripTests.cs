@@ -30,25 +30,17 @@ public class OptionsRoundTripTests
 
     private static async Task<string> DescribeAsync(Type startup, bool withOptions)
     {
-        var env = RemoteHostEnvironment.For(startup);
-        if (withOptions) env.WithOptions(Written);
-
         var builder = new ContainerBuilder()
             .WithImage(HostFixture.Image)
-            .WithBindMount(HostFixture.PluginDir, "/plugin", AccessMode.ReadOnly)
-            .WithEnvironment("LIB_DIR", "/plugin")
-            .WithEnvironment(new Dictionary<string, string>(env))
-            .WithEnvironment("DOTNET_EnableDiagnostics", "0")
-            .WithPortBinding(8080, true)
-            .WithWaitStrategy(Wait.ForUnixContainer()
-                .UntilHttpRequestIsSucceeded(r => r.ForPath("/health").ForPort(8080)));
+            .WithRemoteFacade(startup, HostFixture.PluginDir)
+            .WithEnvironment("DOTNET_EnableDiagnostics", "0");
+
+        if (withOptions) builder = builder.WithOptions(Written);
 
         await using var container = builder.Build();
         await container.StartAsync();
 
-        await using var host = RemoteHost.At(
-            $"http://{container.Hostname}:{container.GetMappedPublicPort(8080)}");
-
+        await using var host = container.RemoteHost();
         return (await host.GetAsync<IOptionsEcho>()).Describe();
     }
 
@@ -78,6 +70,9 @@ public class OptionsRoundTripTests
         // No health wait strategy here on purpose: the container is EXPECTED
         // never to become healthy, so waiting for it would burn the whole
         // timeout to learn something the logs say immediately.
+        // No WithRemoteFacade here: it installs a /health wait strategy, and
+        // this container is EXPECTED never to become healthy, so waiting for it
+        // would burn the whole timeout to learn what the logs say at once.
         await using var container = new ContainerBuilder()
             .WithImage(HostFixture.Image)
             .WithBindMount(HostFixture.PluginDir, "/plugin", AccessMode.ReadOnly)

@@ -1,5 +1,4 @@
 using DotNet.Testcontainers.Builders;
-using DotNet.Testcontainers.Configurations;
 using DotNet.Testcontainers.Containers;
 using RemoteFacadeHost.Client;
 
@@ -9,10 +8,9 @@ namespace RemoteFacade.IntegrationTests;
 /// One container per test class, started from the image under test with the
 /// CsLib composition root mounted.
 ///
-/// This is the same path a consumer walks -- Testcontainers, the real client
-/// package, a real image -- rather than the shell suite's curl. The two are
-/// complementary: run.sh pins the wire format, this pins that the CLIENT
-/// LIBRARY can actually drive it.
+/// This is also where RemoteFacade.Testcontainers is dogfooded: the fixture
+/// uses the same extensions a consumer would, so a regression in them fails
+/// this suite rather than being discovered by whoever installs the package.
 /// </summary>
 public sealed class HostFixture : IAsyncLifetime
 {
@@ -27,7 +25,7 @@ public sealed class HostFixture : IAsyncLifetime
 
     private IContainer _container = null!;
 
-    public string Url { get; private set; } = "";
+    public RemoteHost Host { get; private set; } = null!;
 
     /// <summary>
     /// The published CsLib directory. Located by walking up to the repo root
@@ -52,33 +50,27 @@ public sealed class HostFixture : IAsyncLifetime
         }
     }
 
+    /// <summary>
+    /// Everything a facade container needs, in one call. Compare against what
+    /// this replaced: a bind mount, three environment variables, a port
+    /// binding and a wait strategy, hand-written per fixture.
+    /// </summary>
     public static ContainerBuilder Builder(string pluginDir) =>
         new ContainerBuilder()
             .WithImage(Image)
-            .WithBindMount(pluginDir, "/plugin", AccessMode.ReadOnly)
-            .WithEnvironment("LIB_DIR", "/plugin")
-            // Derived from the TYPE, not typed as strings. This is the helper
-            // under test as much as it is setup: a wrong LIB_REGISTRAR would
-            // fail at container start, and deriving it means the compiler
-            // catches a rename.
-            .WithEnvironment(new Dictionary<string, string>(RemoteHostEnvironment.For(typeof(CsLib.GraphStartup))))
-            .WithEnvironment("DOTNET_EnableDiagnostics", "0")
-            .WithPortBinding(8080, true)
-            // /health, not just an open port: the host binds before the graph
-            // is built, so a port check can hand back a container that is not
-            // yet able to serve anything.
-            .WithWaitStrategy(Wait.ForUnixContainer()
-                .UntilHttpRequestIsSucceeded(r => r.ForPath("/health").ForPort(8080)));
+            .WithRemoteFacade(typeof(CsLib.GraphStartup), pluginDir)
+            .WithEnvironment("DOTNET_EnableDiagnostics", "0");
 
     public async ValueTask InitializeAsync()
     {
         _container = Builder(PluginDir).Build();
         await _container.StartAsync();
-        Url = $"http://{_container.Hostname}:{_container.GetMappedPublicPort(8080)}";
+        Host = _container.RemoteHost();
     }
 
     public async ValueTask DisposeAsync()
     {
+        if (Host is not null) await Host.DisposeAsync();
         if (_container is not null) await _container.DisposeAsync();
     }
 }
