@@ -4,6 +4,27 @@ using DotNet.Testcontainers.Containers;
 
 namespace RemoteFacadeHost.Client;
 
+/// <summary>How the plugin directory reaches the container.</summary>
+public enum PluginTransport
+{
+    /// <summary>
+    /// Bind mount. Fast, and the default, because the common case is a test
+    /// process running on the Docker host.
+    /// </summary>
+    BindMount,
+
+    /// <summary>
+    /// Copy the directory in over the Docker API.
+    ///
+    /// Slower for a large plugin, but it works when the TEST ITSELF runs in a
+    /// container -- a bind mount there names a path on the Docker host, which
+    /// is not the path the test can see, so the container silently gets an
+    /// empty directory. Use this for a containerised test runner, or CI that
+    /// mounts the workspace.
+    /// </summary>
+    Copy,
+}
+
 /// <summary>
 /// Fluent setup for a remote-facade-host container.
 ///
@@ -40,8 +61,14 @@ public static class ContainerBuilderExtensions
     /// </param>
     /// <param name="pluginDirectory">A <c>dotnet publish</c> output directory.</param>
     /// <param name="registrarMethod">Defaults to <c>Configure</c>.</param>
+    /// <param name="transport">
+    /// How the directory reaches the container. Switch to
+    /// <see cref="PluginTransport.Copy"/> when the test process is itself
+    /// containerised.
+    /// </param>
     public static ContainerBuilder WithRemoteFacade(
-        this ContainerBuilder builder, Type startup, string pluginDirectory, string? registrarMethod = null)
+        this ContainerBuilder builder, Type startup, string pluginDirectory,
+        string? registrarMethod = null, PluginTransport transport = PluginTransport.BindMount)
     {
         ArgumentNullException.ThrowIfNull(builder);
         ArgumentNullException.ThrowIfNull(startup);
@@ -59,8 +86,11 @@ public static class ContainerBuilderExtensions
                 "project to it first.");
         }
 
-        builder = builder
-            .WithBindMount(Path.GetFullPath(pluginDirectory), "/plugin", AccessMode.ReadOnly)
+        var full = Path.GetFullPath(pluginDirectory);
+
+        builder = (transport == PluginTransport.Copy
+                ? builder.WithResourceMapping(new DirectoryInfo(full), "/plugin")
+                : builder.WithBindMount(full, "/plugin", AccessMode.ReadOnly))
             .WithEnvironment("LIB_DIR", "/plugin")
             .WithEnvironment(new Dictionary<string, string>(
                 RemoteHostEnvironment.For(startup, registrarMethod)))

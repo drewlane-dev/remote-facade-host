@@ -51,6 +51,28 @@ public class OptionsRoundTripTests
     }
 
     [Fact]
+    public async Task The_copy_transport_delivers_the_plugin_and_the_options()
+    {
+        // PluginTransport.Copy exists for a containerised test runner, where a
+        // bind mount names a host path the test cannot see and the container
+        // silently gets an empty directory. Asserting the SAME expected string
+        // proves the copy delivered a working plugin, not merely that some
+        // container started.
+        var builder = new ContainerBuilder()
+            .WithImage(HostFixture.Image)
+            .WithRemoteFacade(typeof(EchoStartup), HostFixture.PluginDir,
+                transport: PluginTransport.Copy)
+            .WithEnvironment("DOTNET_EnableDiagnostics", "0")
+            .WithOptions(Written);
+
+        await using var container = builder.Build();
+        await container.StartAsync();
+
+        await using var host = container.RemoteHost();
+        Assert.Equal(Expected, (await host.GetAsync<IOptionsEcho>()).Describe());
+    }
+
+    [Fact]
     public async Task The_stock_two_line_pattern_binds_identically()
     {
         // Same options, same assertion, a startup that never calls BindOptions

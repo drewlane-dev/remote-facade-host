@@ -184,7 +184,7 @@ await using var host = container.RemoteHost();
 
 | | |
 |---|---|
-| `WithRemoteFacade` | Bind mount, `LIB_DIR`, `LIB_ASSEMBLY`, `LIB_REGISTRAR`, a random port binding, and a wait on `/health` — not on the port, which is bound before the graph is built. Throws if the plugin directory does not exist, since a missing one bind-mounts as an empty one. |
+| `WithRemoteFacade` | Bind mount, `LIB_DIR`, `LIB_ASSEMBLY`, `LIB_REGISTRAR`, a random port binding, and a wait on `/health` — not on the port, which is bound before the graph is built. Throws if the plugin directory does not exist, since a missing one bind-mounts as an empty one. Pass `transport: PluginTransport.Copy` when the **test itself** runs in a container: a bind mount there names a path on the Docker host, and the container silently gets an empty directory. |
 | `WithOptions` | The same typed push-down as above, straight onto the builder. |
 | `WithSmbMount` | Credentials plus the privileges a cifs mount needs: `SYS_ADMIN`, `DAC_READ_SEARCH`, and `apparmor=unconfined`. Without them the mount fails with a message that mentions none of them. |
 | `RemoteHost()` | A client on the **mapped** port, so there is no hostname/port string to get subtly wrong. |
