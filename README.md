@@ -163,6 +163,60 @@ and plain synchronous returns. An async method hands its `Task` back before
 the round trip completes, so `Task.WhenAll(a.X(), b.X())` really does overlap
 two containers.
 
+## Pushing config into the container
+
+Options travel as environment variables, written from a typed object and bound
+back with stock `IConfiguration`. The **options type is the only shared
+symbol** — rename it and the compiler breaks both ends.
+
+**In the fixture:**
+
+```csharp
+var env = RemoteHostEnvironment.For(typeof(TestStartup))
+    .WithOptions(new StoreOptions { RootPath = "/mnt/share", Retries = 5 });
+
+foreach (var (key, value) in env)
+    builder = builder.WithEnvironment(key, value);
+```
+
+That emits `StoreOptions__RootPath` and `StoreOptions__Retries` — the shape
+`AddEnvironmentVariables()` reads. The section defaults to the type's short
+name; pass one explicitly to override it.
+
+**In the startup:**
+
+```csharp
+services.BindOptions<StoreOptions>();
+```
+
+Or the same thing without this package, if you prefer nothing bespoke in your
+wiring:
+
+```csharp
+var config = new ConfigurationBuilder().AddEnvironmentVariables().Build();
+services.Configure<StoreOptions>(config.GetSection(nameof(StoreOptions)));
+```
+
+What `BindOptions` adds is a guard: a section the fixture never set is a
+**startup failure**, not a silent fall back to defaults. Pass `optional: true`
+to accept the defaults deliberately. It is also the *smaller* dependency for a
+plain class library — the two stock lines need
+`Microsoft.Extensions.Configuration.EnvironmentVariables` and
+`Microsoft.Extensions.Options.ConfigurationExtensions`, both of which this
+package already brings in.
+
+Nested objects and collections work (`Tags__0`, `Nested__Name`), enums travel
+as names so `docker inspect` stays readable, and a **null property emits
+nothing** — meaning "keep whatever the startup decided", since an environment
+variable cannot distinguish absent from empty.
+
+Bare values that are not an options class keep using `WithEnvironment`.
+
+> Environment variables are visible in `docker inspect`. That is the same
+> exposure the old `LIB_OPTIONS` had and it is fine for test containers, but
+> do not put a production secret through it — read those from a mounted file
+> inside the startup instead.
+
 ## Substituting a dependency
 
 `LIB_SERVICES` maps an interface to an implementation, both resolved from the

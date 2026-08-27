@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -890,5 +891,60 @@ public static class IncompleteStartup
         services.Configure<StoreOptions>(o => o.RootPath = "/tmp");
         services.AddSingleton<Store>();
         services.AddSingleton<IStore>(sp => sp.GetRequiredService<Store>());
+    }
+}
+
+/// <summary>
+/// Options whose defaults are deliberately absurd. A test asserting the values
+/// arrived has to be able to tell "bound from the environment" from "fell back
+/// to the defaults", and defaults like "/tmp" or 3 would be indistinguishable
+/// from a plausible configured value.
+/// </summary>
+public sealed class EchoOptions
+{
+    public string RootPath { get; set; } = "NEVER-SET";
+    public TimeSpan Timeout { get; set; } = TimeSpan.Zero;
+    public int Retries { get; set; } = -1;
+    public bool Enabled { get; set; }
+    public List<string> Tags { get; set; } = [];
+}
+
+public interface IOptionsEcho
+{
+    string Describe();
+}
+
+/// <summary>Reports what the container actually bound, so a test can compare
+/// it against what the fixture wrote.</summary>
+public sealed class OptionsEcho(IOptions<EchoOptions> options) : IOptionsEcho
+{
+    public string Describe()
+    {
+        var o = options.Value;
+        return $"{o.RootPath}|{o.Timeout}|{o.Retries}|{o.Enabled}|{string.Join(",", o.Tags)}";
+    }
+}
+
+/// <summary>The startup a consumer would write: BindOptions, then registrations.</summary>
+public static class EchoStartup
+{
+    public static void Configure(IServiceCollection services)
+    {
+        services.BindOptions<EchoOptions>();
+        services.AddSingleton<IOptionsEcho, OptionsEcho>();
+    }
+}
+
+/// <summary>The same graph, bound the STOCK way -- no BindOptions, no reference
+/// to this package needed. Proves the documented two-line pattern really is
+/// equivalent rather than merely claimed to be.</summary>
+public static class EchoStockStartup
+{
+    public static void Configure(IServiceCollection services)
+    {
+        var config = new ConfigurationBuilder().AddEnvironmentVariables().Build();
+
+        services.Configure<EchoOptions>(config.GetSection(nameof(EchoOptions)));
+        services.AddSingleton<IOptionsEcho, OptionsEcho>();
     }
 }
