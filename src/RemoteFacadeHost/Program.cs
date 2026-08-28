@@ -6,6 +6,7 @@ var dir      = Environment.GetEnvironmentVariable("LIB_DIR") ?? "/plugin";
 var asmFile  = Environment.GetEnvironmentVariable("LIB_ASSEMBLY")
                ?? throw new InvalidOperationException("LIB_ASSEMBLY is required");
 var servicesJson = Environment.GetEnvironmentVariable("LIB_SERVICES") ?? "{}";
+var interceptsJson = Environment.GetEnvironmentVariable("LIB_INTERCEPT") ?? "{}";
 var registrar = Environment.GetEnvironmentVariable("LIB_REGISTRAR");
 var port     = Environment.GetEnvironmentVariable("LIB_PORT") ?? "8080";
 
@@ -61,7 +62,7 @@ PluginLoader.LoadAssembly(dir, asmFile);
 // One graph serves every call for the container's lifetime; that is what
 // allows a method to acquire a resource and a later call to release it.
 // InstanceHolder owns it so DELETE /instance can reset it between tests.
-var holder = new InstanceHolder(() => Activation.Build(registrar, servicesJson));
+var holder = new InstanceHolder(() => Activation.Build(registrar, servicesJson, interceptsJson));
 
 var builder = WebApplication.CreateBuilder(args);
 builder.WebHost.UseUrls($"http://0.0.0.0:{port}");

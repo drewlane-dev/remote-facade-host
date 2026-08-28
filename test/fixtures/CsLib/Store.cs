@@ -948,3 +948,65 @@ public static class EchoStockStartup
         services.AddSingleton<IOptionsEcho, OptionsEcho>();
     }
 }
+
+/// <summary>
+/// A multi-step job: stages N files, one at a time, through an injected
+/// dependency. The dependency is the seam an interceptor uses -- without it
+/// there would be nothing between the steps to interpose on.
+/// </summary>
+public interface IStager
+{
+    Task<int> StageAsync(string dir, int count);
+}
+
+/// <summary>The per-step dependency. Deliberately behind an interface,
+/// because a call to File.WriteAllText directly would be invisible to any
+/// DI-boundary interceptor.</summary>
+public interface IFileWriter
+{
+    void Write(string path, string content);
+}
+
+public sealed class FileWriter : IFileWriter
+{
+    public void Write(string path, string content) => File.WriteAllText(path, content);
+}
+
+public sealed class Stager(IFileWriter writer) : IStager
+{
+    public Task<int> StageAsync(string dir, int count)
+    {
+        Directory.CreateDirectory(dir);
+
+        for (var i = 0; i < count; i++)
+        {
+            // One DI-boundary crossing per file: this is the step boundary an
+            // interceptor can stop at.
+            writer.Write(Path.Combine(dir, $"file-{i:D3}.txt"), $"content {i}");
+        }
+
+        return Task.FromResult(count);
+    }
+}
+
+/// <summary>Counts what actually landed, so a test can see how far a killed
+/// job got.</summary>
+public interface IStageInspector
+{
+    int Count(string dir);
+}
+
+public sealed class StageInspector : IStageInspector
+{
+    public int Count(string dir) => Directory.Exists(dir) ? Directory.GetFiles(dir).Length : 0;
+}
+
+public static class StagerStartup
+{
+    public static void Configure(IServiceCollection services)
+    {
+        services.AddSingleton<IFileWriter, FileWriter>();
+        services.AddSingleton<IStager, Stager>();
+        services.AddSingleton<IStageInspector, StageInspector>();
+    }
+}

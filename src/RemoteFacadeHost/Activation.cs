@@ -28,7 +28,13 @@ public static class Activation
     /// "real wiring, one thing faked" is expressed without the plugin needing
     /// to know it is under test.
     /// </param>
-    public static HostedGraph Build(string registrar, string servicesJson)
+    /// <param name="interceptsJson">
+    /// Interface-to-URL map. Each named service is WRAPPED (not replaced) by a
+    /// proxy that tells the test process before every call and waits for its
+    /// answer -- so a test can hold, fail, or kill the container at a known
+    /// point inside the graph.
+    /// </param>
+    public static HostedGraph Build(string registrar, string servicesJson, string interceptsJson)
     {
         var services = new ServiceCollection();
         services.AddLogging();
@@ -56,6 +62,30 @@ public static class Activation
             // Replace, not Add: these are overrides on top of what the startup
             // already wired, and Replace says so unambiguously.
             services.Replace(ServiceDescriptor.Singleton(serviceType, implType));
+        }
+
+        var intercepts = JsonSerializer.Deserialize<Dictionary<string, string>>(
+                             string.IsNullOrWhiteSpace(interceptsJson) ? "{}" : interceptsJson)
+                         ?? [];
+
+        foreach (var (interfaceName, url) in intercepts)
+        {
+            var interfaceType = PluginLoader.Assembly?.GetType(interfaceName)
+                ?? throw new InvalidOperationException(
+                    $"LIB_INTERCEPT names '{interfaceName}', which is not in the assembly. " +
+                    $"Available: {string.Join(", ", PluginLoader.TypeNames())}");
+
+            // The registration that WOULD have served this type, captured
+            // before it is replaced. The wrapper has to build the real thing to
+            // delegate to, and the only faithful way to do that is to honour
+            // whatever the startup actually registered.
+            var original = services.LastOrDefault(d => d.ServiceType == interfaceType)
+                ?? throw new InvalidOperationException(
+                    $"LIB_INTERCEPT names '{interfaceName}', which the startup never registered. " +
+                    "There is nothing to wrap. Register it, or remove the intercept.");
+
+            services.Replace(ServiceDescriptor.Singleton(
+                interfaceType, sp => InterceptProxy.Wrap(interfaceType, Materialise(original, sp), url)));
         }
 
         // Captured BEFORE building: a ServiceCollection is the list of
@@ -95,6 +125,33 @@ public static class Activation
         // Transient registration yield a new instance per call, and what lets
         // a reset rebuild the graph without invalidating any client proxy.
         return new HostedGraph(services.BuildServiceProvider(), serviceNames, scopedNames);
+    }
+
+    /// <summary>
+    /// Builds the instance a descriptor describes.
+    ///
+    /// Only the three standard shapes, and an explicit failure otherwise.
+    /// Descriptor inspection has bitten this codebase before -- a keyed
+    /// descriptor's ImplementationInstance THREW in
+    /// Microsoft.Extensions.DependencyInjection.Abstractions 8.0.0 and returns
+    /// null in 9.0.0+ -- so this reads the three properties it understands and
+    /// says so plainly when it meets something else, rather than silently
+    /// producing a wrapper around nothing.
+    /// </summary>
+    private static object Materialise(ServiceDescriptor descriptor, IServiceProvider provider)
+    {
+        if (descriptor.ImplementationInstance is { } instance) return instance;
+        if (descriptor.ImplementationFactory is { } factory) return factory(provider);
+
+        if (descriptor.ImplementationType is { } type)
+        {
+            return ActivatorUtilities.CreateInstance(provider, type);
+        }
+
+        throw new InvalidOperationException(
+            $"cannot intercept '{descriptor.ServiceType.FullName}': its registration is not a " +
+            "type, factory or instance, so there is no way to build the real implementation to " +
+            "delegate to. Register it one of those three ways, or remove the intercept.");
     }
 
     /// <summary>
