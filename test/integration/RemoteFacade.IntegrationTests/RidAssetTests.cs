@@ -42,4 +42,30 @@ public class RidAssetTests
         Assert.Contains("runtimes/", described);
         Assert.Contains("/lib/", described);
     }
+
+    [Fact]
+    public async Task The_image_is_not_in_globalization_invariant_mode()
+    {
+        // Alpine .NET images are invariant by default. A plugin only discovers
+        // it at the first culture-aware operation -- for SqlClient that is the
+        // first CONNECTION, which makes it look like a database problem.
+        await using var container = new ContainerBuilder()
+            .WithImage(HostFixture.Image)
+            .WithRemoteFacade(typeof(GlobalizationProbeStartup), HostFixture.PluginDir)
+            .WithEnvironment("DOTNET_EnableDiagnostics", "0")
+            .Build();
+
+        await container.StartAsync();
+
+        await using var host = container.RemoteHost();
+        var probe = await host.GetAsync<IGlobalizationProbe>();
+
+        // Throws before returning if the image is invariant, so reaching the
+        // assertion is most of the proof. The symbol pins that real ICU data is
+        // present rather than a stub culture.
+        var described = probe.Describe();
+
+        Assert.StartsWith("en-GB|", described);
+        Assert.Contains("\u00A3", described.Replace("£", "\u00A3"));
+    }
 }

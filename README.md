@@ -53,7 +53,7 @@ dotnet publish MyApp.csproj -o ./publish
 docker run -v "$(pwd)/publish:/plugin:ro" \
   -e LIB_ASSEMBLY=MyApp.dll \
   -e LIB_REGISTRAR=MyApp.TestStartup.Configure \
-  -p 8080:8080 ghcr.io/drewlane-dev/remote-facade-host:3.3.0
+  -p 8080:8080 ghcr.io/drewlane-dev/remote-facade-host:3.3.1
 ```
 
 Then drive it. With [Testcontainers](https://dotnet.testcontainers.org/), the
@@ -172,7 +172,7 @@ Testcontainers.
 
 ```csharp
 await using var container = new ContainerBuilder()
-    .WithImage("ghcr.io/drewlane-dev/remote-facade-host:3.3.0")
+    .WithImage("ghcr.io/drewlane-dev/remote-facade-host:3.3.1")
     .WithRemoteFacade(typeof(TestStartup), pluginDir)
     .WithOptions(new StoreOptions { RootPath = "/mnt/share" })
     .WithSmbMount(new SmbMount { Server = "samba", Share = "data" })
@@ -275,6 +275,12 @@ proxies you already hold keep working, because services resolve per call.
 `LD_LIBRARY_PATH`, no knowing the image's RID. The image is Alpine, so the RID
 is `linux-musl-*`; a package shipping only `linux-x64` will not load, and the
 error says so, naming the library and every directory searched.
+
+**Globalization is enabled.** Alpine .NET images run in invariant mode by
+default, where anything culture-aware throws *"Globalization Invariant Mode is
+not supported"*. `Microsoft.Data.SqlClient` raises it on the first CONNECTION,
+long after the assembly loaded fine, so it reads as a database fault rather
+than an image one. The image ships ICU and turns invariant mode off.
 
 **RID-specific assemblies resolve too.** A package that ships a reference stub
 at its root and the real build under `runtimes/<rid>/lib` — `Microsoft.Data.SqlClient`

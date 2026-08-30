@@ -979,3 +979,35 @@ public static class SqlProbeStartup
     public static void Configure(IServiceCollection services) =>
         services.AddSingleton<ISqlProbe, SqlProbe>();
 }
+
+/// <summary>
+/// Proves the container is not running in globalization-invariant mode.
+///
+/// Alpine .NET images are invariant by default, and a plugin doing anything
+/// culture-aware then fails with "Globalization Invariant Mode is not
+/// supported". Microsoft.Data.SqlClient throws it on the first CONNECTION --
+/// long after the assembly loaded fine -- so it reads as a database fault
+/// rather than an image one. Asking a culture directly needs no database and
+/// fails in the same place.
+/// </summary>
+public interface IGlobalizationProbe
+{
+    string Describe();
+}
+
+public sealed class GlobalizationProbe : IGlobalizationProbe
+{
+    public string Describe()
+    {
+        // Throws in invariant mode. In a working image it returns the real
+        // culture, whose currency symbol is not the invariant one.
+        var culture = System.Globalization.CultureInfo.GetCultureInfo("en-GB");
+        return $"{culture.Name}|{culture.NumberFormat.CurrencySymbol}";
+    }
+}
+
+public static class GlobalizationProbeStartup
+{
+    public static void Configure(IServiceCollection services) =>
+        services.AddSingleton<IGlobalizationProbe, GlobalizationProbe>();
+}

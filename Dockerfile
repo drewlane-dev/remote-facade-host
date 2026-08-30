@@ -7,8 +7,18 @@ RUN dotnet publish src/RemoteFacadeHost/RemoteFacadeHost.csproj -c Release -o /a
 
 FROM mcr.microsoft.com/dotnet/aspnet:10.0-alpine
 
-# Only needed when LIB mounting is configured; harmless otherwise and small.
-RUN apk add --no-cache cifs-utils
+# cifs-utils is only needed when LIB mounting is configured; harmless otherwise.
+#
+# icu-libs is needed far more often than it looks. The Alpine .NET images run in
+# globalization-invariant mode, and a plugin doing anything culture-aware fails
+# with "Globalization Invariant Mode is not supported" -- Microsoft.Data.SqlClient
+# throws it on the first CONNECTION, long after the assembly loaded fine, so it
+# reads as a database problem rather than an image one.
+RUN apk add --no-cache cifs-utils icu-libs icu-data-full
+
+# Full globalization, now that ICU is present. Without flipping this the
+# package is installed and ignored.
+ENV DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=false
 
 WORKDIR /app
 COPY --from=build /app .
