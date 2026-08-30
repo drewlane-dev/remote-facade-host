@@ -21,27 +21,17 @@ cleanup() {
 trap cleanup EXIT
 docker network create "${NET}" >/dev/null
 
-start_host() { # start_host <alias> <pluginDir> <assembly> <registrar> [servicesJson] [storeRoot] [sentinelPath]
+start_host() { # start_host <alias> <pluginDir> <assembly> <registrar> [storeRoot] [sentinelPath]
   # DOTNET_EnableDiagnostics=0: belt-and-suspenders alongside giving the
   # plugin its own private RootPath (below) -- without it the runtime drops
   # its own diagnostic pipe/socket files straight into /tmp, which would
   # again pollute any OTHER process's directory count if it ever pointed
   # back at /tmp directly.
-  #
-  # servicesJson is computed on its own line rather
-  # than inline as "${6:-{}}": a bare "{" inside a ${...:-word} default is
-  # not brace-matched against the "}" that closes the expansion, so the
-  # parser closes the expansion at the FIRST "}" and leaves a stray "}"
-  # behind in the shell word -- corrupting the value (to "...}}") even when
-  # the positional argument IS set.
-  servicesJson="${5:-}"
-  [ -z "$servicesJson" ] && servicesJson='{}'
   docker run -d --rm --name "$1-${NET}" --network "${NET}" --network-alias "$1" \
     -v "$2:/plugin:ro" \
     -e LIB_DIR=/plugin -e LIB_ASSEMBLY="$3" -e LIB_REGISTRAR="$4" \
-    -e LIB_SERVICES="$servicesJson" \
-    -e STORE_ROOT="${6:-/tmp}" \
-    -e SENTINEL_PATH="${7:-}" \
+    -e STORE_ROOT="${5:-/tmp}" \
+    -e SENTINEL_PATH="${6:-}" \
     -e DOTNET_EnableDiagnostics=0 \
     "$IMAGE" >/dev/null 2>&1
 }
@@ -102,7 +92,7 @@ echo "== loads and constructs a C# class =="
 # own diagnostic pipe/socket files, which Store.Count() -- Directory.GetFiles
 # over RootPath -- would otherwise count as its own.
 start_host cs "${HERE}/publish/cslib" CsLib.dll CsLib.StoreStartup.Configure \
-  '{"CsLib.IStamp":"CsLib.RealStamp"}' /tmp/cslib-data
+  /tmp/cslib-data
 if wait_healthy cs; then
   ok "host constructs the configured type"
 else
@@ -353,7 +343,7 @@ api cs /health | grep -q "CsLib.Store" \
   && ok "host still serves after a reset" || bad "host still serves after a reset"
 
 echo "== the same image serves a VB library, unchanged =="
-start_host vb "${HERE}/publish/vblib" VbLib.dll VbLib.VbStartup.Configure '{}' /tmp
+start_host vb "${HERE}/publish/vblib" VbLib.dll VbLib.VbStartup.Configure /tmp
 if wait_healthy vb; then
   ok "host constructs a VB type"
 else
@@ -382,7 +372,6 @@ for n in ia ib; do
     -v "${HERE}/publish/cslib:/plugin:ro" \
     -e LIB_DIR=/plugin -e LIB_ASSEMBLY=CsLib.dll \
     -e LIB_REGISTRAR=CsLib.StoreStartup.Configure -e STORE_ROOT=/mnt/share \
-    -e LIB_SERVICES='{"CsLib.IStamp":"CsLib.RealStamp"}' \
     -e SMB_SERVER=samba -e SMB_SHARE=data \
     "$IMAGE" >/dev/null 2>&1
 done
@@ -465,8 +454,7 @@ fi
 docker rm -f "badcfg-${NET}" >/dev/null 2>&1 || true
 
 echo "== service registration =="
-start_host stampreal "${HERE}/publish/cslib" CsLib.dll CsLib.StoreStartup.Configure \
-  '{"CsLib.IStamp":"CsLib.RealStamp"}'
+start_host stampreal "${HERE}/publish/cslib" CsLib.dll CsLib.StoreStartup.Configure
 wait_healthy stampreal \
   && ok "constructs a type with a registered dependency" \
   || bad "constructs a type with a registered dependency"
@@ -475,33 +463,73 @@ api stampreal /invoke -X POST -H 'Content-Type: application/json' \
   -d '{"service":"CsLib.Store","method":"Stamp","args":[]}' | grep -q '"result":"real"' \
   && ok "resolves the registered implementation" || bad "resolves the registered implementation"
 
-# The same library, a different implementation, no rebuild: this is how you
-# substitute a fake for a dependency.
-start_host stampfake "${HERE}/publish/cslib" CsLib.dll CsLib.StoreStartup.Configure \
-  '{"CsLib.IStamp":"CsLib.FakeStamp"}'
-wait_healthy stampfake >/dev/null 2>&1
-api stampfake /invoke -X POST -H 'Content-Type: application/json' \
-  -d '{"service":"CsLib.Store","method":"Stamp","args":[]}' | grep -q '"result":"fake"' \
-  && ok "a fake can be substituted by configuration alone" \
-  || bad "a fake can be substituted by configuration alone"
+echo "== a removed configuration variable is refused, not ignored =="
+# Nothing covered this before: the guard in Program.cs that rejects LIB_TYPE
+# and LIB_OPTIONS had no test at any level, so deleting it would have broken
+# nothing. It matters because a config carried forward unchanged would
+# otherwise start cleanly and serve a graph that silently did not include what
+# the operator asked for -- which is the whole reason the guard exists.
+#
+# LIB_SERVICES joins them: interface-to-implementation overrides are gone, and
+# a startup that composes another startup and calls Replace expresses the same
+# thing in ordinary C# (CsLib.FakeStampStartup, exercised below).
+for gone in LIB_TYPE LIB_OPTIONS LIB_SERVICES; do
+  docker run -d --name "gone-${NET}" --network "${NET}" \
+    -v "${HERE}/publish/cslib:/plugin:ro" \
+    -e LIB_DIR=/plugin -e LIB_ASSEMBLY=CsLib.dll \
+    -e LIB_REGISTRAR=CsLib.StoreStartup.Configure \
+    -e "${gone}={\"CsLib.IStamp\":\"CsLib.FakeStamp\"}" \
+    "$IMAGE" >/dev/null 2>&1
+  if code="$(wait_stopped "gone-${NET}")" && [ "$code" -ne 0 ] \
+     && docker logs "gone-${NET}" 2>&1 | grep -q "${gone}"; then
+    ok "${gone} is refused at startup, naming itself"
+  else
+    docker logs "gone-${NET}" 2>&1 | tail -4
+    bad "${gone} is refused at startup, naming itself"
+  fi
+  docker rm -f "gone-${NET}" >/dev/null 2>&1 || true
+done
+
+# "{}" must NOT count as set. It was LIB_OPTIONS's own default in v2 and
+# LIB_SERVICES's default in v3, so every harness and compose file in existence
+# passes it as inert filler -- refusing it would reject configurations that ask
+# for nothing at all. This is the same over-strict guard the codebase already
+# got wrong once and documented.
+docker run -d --name "inert-${NET}" --network "${NET}" --network-alias inert \
+  -v "${HERE}/publish/cslib:/plugin:ro" \
+  -e LIB_DIR=/plugin -e LIB_ASSEMBLY=CsLib.dll \
+  -e LIB_REGISTRAR=CsLib.StoreStartup.Configure \
+  -e LIB_OPTIONS='{}' -e LIB_SERVICES='{}' -e LIB_TYPE='' \
+  "$IMAGE" >/dev/null 2>&1
+if wait_healthy inert; then
+  ok "an inert '{}' carried forward from an old harness still starts"
+else
+  docker logs "inert-${NET}" 2>&1 | tail -4
+  bad "an inert '{}' carried forward from an old harness still starts"
+fi
+docker rm -f "inert-${NET}" >/dev/null 2>&1 || true
 
 echo "== LIB_REGISTRAR wires the graph from the app's own code =="
 start_host reg "${HERE}/publish/cslib" CsLib.dll CsLib.Registration.AddCsLib
 wait_healthy reg \
-  && ok "registrar supplies dependencies with no LIB_SERVICES" \
-  || bad "registrar supplies dependencies with no LIB_SERVICES"
+  && ok "an extension-method registrar supplies its own dependencies" \
+  || bad "an extension-method registrar supplies its own dependencies"
 
 api reg /invoke -X POST -H 'Content-Type: application/json' \
   -d '{"service":"CsLib.Store","method":"Stamp","args":[]}' | grep -q '"result":"real"' \
   && ok "registrar's registration is used" || bad "registrar's registration is used"
 
-# The combination that matters: real wiring, one thing faked.
-start_host regfake "${HERE}/publish/cslib" CsLib.dll CsLib.Registration.AddCsLib \
-  '{"CsLib.IStamp":"CsLib.FakeStamp"}'
+# The combination that matters: real wiring, one thing faked. This is what
+# LIB_SERVICES existed for, and CsLib.FakeStampStartup is the whole of its
+# replacement -- a startup that calls the real composition root (an extension
+# method) and then Replace. If a substitution ever stopped applying, this case
+# would report "real" instead of "fake".
+start_host regfake "${HERE}/publish/cslib" CsLib.dll CsLib.FakeStampStartup.Configure
 wait_healthy regfake >/dev/null 2>&1
 api regfake /invoke -X POST -H 'Content-Type: application/json' \
   -d '{"service":"CsLib.Store","method":"Stamp","args":[]}' | grep -q '"result":"fake"' \
-  && ok "LIB_SERVICES overrides the registrar" || bad "LIB_SERVICES overrides the registrar"
+  && ok "a startup can compose real wiring and replace one dependency" \
+  || bad "a startup can compose real wiring and replace one dependency"
 
 echo "== an unregistered dependency is named when the call needs it =="
 # v2 caught this at startup: LIB_TYPE made the host construct the root before
@@ -691,7 +719,7 @@ echo "== a reset lands safely against calls already in flight =="
 # and then wedged every later call -- see task-5-report.md -- which is why
 # InstanceHolder holds no lock across the await.
 start_host inflight "${HERE}/publish/cslib" CsLib.dll CsLib.DisposableRootStartup.Configure \
-  '{}' /tmp /tmp/disposed-inflight
+  /tmp /tmp/disposed-inflight
 wait_healthy inflight && ok "the in-flight host constructs" \
                       || bad "the in-flight host constructs"
 
@@ -785,7 +813,7 @@ echo "== a plugin Dispose() that throws must not destroy an innocent caller's re
 # depends on scheduling, so the same plugin defect would destroy a different
 # arbitrary request every run.
 start_host disposethrow "${HERE}/publish/cslib" CsLib.dll CsLib.ThrowingDisposableRootStartup.Configure \
-  '{}' /tmp /tmp/throwing-disposed
+  /tmp /tmp/throwing-disposed
 wait_healthy disposethrow && ok "a root with a throwing Dispose() constructs" \
                           || bad "a root with a throwing Dispose() constructs"
 

@@ -25,8 +25,8 @@ contract.
 > **v3 is breaking.** Single-class hosting (`LIB_TYPE`, `LIB_OPTIONS`) and the
 > client's `RemoteFacade.For<T>(url)` are gone — a startup is the only way to
 > host, `RemoteHost` the only way to call. Callbacks (`LIB_CALLBACKS`,
-> `CallbackHost`) are out for now and preserved on the `callbacks` branch; use
-> `LIB_SERVICES` to substitute a dependency meanwhile.
+> `CallbackHost`) are out for now and preserved on the `callbacks` branch;
+> write a startup that substitutes the dependency meanwhile.
 
 ## Quick start
 
@@ -81,7 +81,7 @@ flowchart LR
     end
 
     out -- "bind mount" --> mnt
-    env["LIB_ASSEMBLY / LIB_REGISTRAR<br/>LIB_SERVICES"] -- "env vars" --> load
+    env["LIB_ASSEMBLY / LIB_REGISTRAR"] -- "env vars" --> load
 
     inst -.-> shared[("shared state<br/>SMB share, SQL, ...")]
 ```
@@ -116,7 +116,6 @@ sequenceDiagram
 | `LIB_ASSEMBLY` | **required** | Assembly file name inside `LIB_DIR`, e.g. `MyApp.dll`. |
 | `LIB_REGISTRAR` | **required** | `Namespace.Type.Method` — a static method taking an `IServiceCollection`. Unset is a fatal startup error. |
 | `LIB_DIR` | `/plugin` | Directory containing the publish output. |
-| `LIB_SERVICES` | `{}` | Interface-to-implementation overrides, applied *after* the startup. See below. |
 | `LIB_PORT` | `8080` | Port to listen on. |
 
 ### Mounting an SMB share
@@ -250,15 +249,34 @@ Bare values that are not an options class keep using `WithEnvironment`.
 
 ## Substituting a dependency
 
-`LIB_SERVICES` maps an interface to an implementation, both resolved from the
-plugin assembly, applied *after* your startup runs:
+Write a startup that calls your real one and then replaces the one thing you
+want faked:
 
-```
--e LIB_SERVICES='{"MyApp.IClock":"MyApp.Testing.FixedClock"}'
+```csharp
+public static class TestStartup
+{
+    public static void Configure(IServiceCollection services)
+    {
+        Production.Configure(services);                 // real wiring
+        services.Replace(ServiceDescriptor.Singleton<IClock, FixedClock>());
+    }
+}
 ```
 
-Real wiring, one thing faked — without the plugin knowing it is under test.
-The fake must be a type in the plugin assembly.
+Point `LIB_REGISTRAR` at it. Real wiring, one thing faked — without the plugin
+knowing it is under test. The fake must be a type in the plugin assembly, since
+a mock built in your test process cannot be injected into a remote instance.
+
+Because this is ordinary C#, you choose the lifetime, and you can substitute a
+factory, a keyed service, or nothing at all depending on an environment
+variable the startup reads itself.
+
+> **Removed in v4.** `LIB_SERVICES` took a JSON interface-to-implementation map
+> and applied it after your startup. It always registered `Singleton`, which
+> silently changed the semantics of a `Transient` dependency. Setting it is now
+> a fatal startup error naming this replacement, rather than being ignored — a
+> suite that believed it was running against a fake would otherwise run against
+> the real dependency and still pass its health check.
 
 ## Things worth knowing
 

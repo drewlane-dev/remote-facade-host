@@ -52,7 +52,6 @@ public class SmbMountTests : IAsyncLifetime
             .WithRemoteFacade(typeof(StoreStartup), HostFixture.PluginDir)
             .WithNetwork(_network)
             .WithEnvironment("STORE_ROOT", "/mnt/share")
-            .WithEnvironment("LIB_SERVICES", """{"CsLib.IStamp":"CsLib.RealStamp"}""")
             .WithEnvironment("DOTNET_EnableDiagnostics", "0")
             .WithSmbMount(new SmbMount
             {

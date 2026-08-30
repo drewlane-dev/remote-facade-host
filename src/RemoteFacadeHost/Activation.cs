@@ -1,18 +1,15 @@
-using System.Text.Json;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.DependencyInjection.Extensions;
 
 namespace RemoteFacadeHost;
 
 public static class Activation
 {
     /// <summary>
-    /// Builds the plugin's service graph by running its own startup, then
-    /// applying the two overrides the container configuration allows.
+    /// Builds the plugin's service graph by running its own startup.
     ///
-    /// The startup does the DI work. That is the whole model: wiring is C# in
-    /// the plugin, written against IServiceCollection like any other
-    /// application, rather than a configuration language invented here.
+    /// The startup does the DI work -- all of it. That is the whole model:
+    /// wiring is C# in the plugin, written against IServiceCollection like any
+    /// other application, rather than a configuration language invented here.
     ///
     /// v3 removed the alternative -- a single class named by LIB_TYPE and
     /// constructed by the host. Everything that existed to serve it went with
@@ -21,42 +18,33 @@ public static class Activation
     /// recursive auto-registration of concrete constructor dependencies. None
     /// of that is a behaviour change here, because all three keyed off the
     /// root type and were already dead code whenever a registrar was used.
+    ///
+    /// v4 removed the last of it: LIB_SERVICES, a JSON map of interface name
+    /// to implementation name applied with Replace after this ran. It was the
+    /// surviving piece of exactly the configuration language the paragraph
+    /// above rejects, and it bought nothing a startup cannot say better. "Real
+    /// wiring, one thing faked" is now what it always should have been --
+    /// a startup that calls another startup and then Replace:
+    ///
+    ///     public static void Configure(IServiceCollection services)
+    ///     {
+    ///         RealStartup.Configure(services);
+    ///         services.Replace(ServiceDescriptor.Singleton&lt;IClock, FixedClock&gt;());
+    ///     }
+    ///
+    /// That is compile-checked, and it can express what the map could not: the
+    /// lifetime to register at (the map always forced Singleton, silently
+    /// changing a Transient dependency's semantics), a factory, a keyed
+    /// service, or a substitution made conditionally.
     /// </summary>
-    /// <param name="servicesJson">
-    /// Interface-to-implementation overrides, resolved out of the PLUGIN
-    /// assembly and applied with Replace AFTER the startup runs. This is how
-    /// "real wiring, one thing faked" is expressed without the plugin needing
-    /// to know it is under test.
-    /// </param>
-    public static HostedGraph Build(string registrar, string servicesJson)
+    public static HostedGraph Build(string registrar)
     {
         var services = new ServiceCollection();
         services.AddLogging();
 
-        // The application's own registration method. Runs FIRST so the
-        // overrides below can replace any part of it.
+        // The application's own registration method, and the only thing that
+        // registers anything. Nothing runs after it.
         InvokeRegistrar(services, registrar);
-
-        var map = JsonSerializer.Deserialize<Dictionary<string, string>>(
-                      string.IsNullOrWhiteSpace(servicesJson) ? "{}" : servicesJson)
-                  ?? [];
-
-        foreach (var (serviceName, implName) in map)
-        {
-            var serviceType = PluginLoader.Assembly?.GetType(serviceName)
-                ?? throw new InvalidOperationException(
-                    $"LIB_SERVICES names service type '{serviceName}', which is not in the assembly. " +
-                    $"Available: {string.Join(", ", PluginLoader.TypeNames())}");
-
-            var implType = PluginLoader.Assembly?.GetType(implName)
-                ?? throw new InvalidOperationException(
-                    $"LIB_SERVICES names implementation '{implName}', which is not in the assembly. " +
-                    $"Available: {string.Join(", ", PluginLoader.TypeNames())}");
-
-            // Replace, not Add: these are overrides on top of what the startup
-            // already wired, and Replace says so unambiguously.
-            services.Replace(ServiceDescriptor.Singleton(serviceType, implType));
-        }
 
         // Captured BEFORE building: a ServiceCollection is the list of
         // descriptors, and it is the only place registered service types can

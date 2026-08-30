@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -36,8 +37,9 @@ public sealed class RealStamp : IStamp
 }
 
 // A fake compiled INTO the plugin. Mocks from the test process cannot be
-// injected into a remote instance; a fake named in LIB_SERVICES is how you
-// substitute behaviour.
+// injected into a remote instance, so a fake has to be a type the plugin
+// itself carries; a startup that registers it is how you substitute behaviour
+// (see FakeStampStartup).
 public sealed class FakeStamp : IStamp
 {
     public string Value() => "fake";
@@ -810,7 +812,8 @@ public static class AsyncOnlyStartup
 }
 
 /// <summary>Registers IStore -> Store, and Store's own IStamp dependency,
-/// from a REGISTRAR rather than from LIB_SERVICES.
+/// from a REGISTRAR rather than from the interface-to-implementation map that
+/// v3 accepted as LIB_SERVICES.
 ///
 /// Exists to de-confound the unbindable-LIB_OPTIONS guard. The first version
 /// of that test used CsLib.IRootFacade, whose implementation takes no
@@ -857,8 +860,8 @@ public static class StoreStartup
 
         services.Configure<StoreOptions>(o => o.RootPath = root);
 
-        // The default. LIB_SERVICES can still Replace it with FakeStamp or
-        // SecretStamp, which applies after this method runs.
+        // The default. A startup wanting FakeStamp or SecretStamp instead
+        // calls this method and then Replace -- see FakeStampStartup.
         services.AddSingleton<IStamp, RealStamp>();
 
         // Registered BOTH ways, resolving to ONE instance. v2 could name the
@@ -871,6 +874,29 @@ public static class StoreStartup
         // cases would stop contending with each other.
         services.AddSingleton<Store>();
         services.AddSingleton<IStore>(sp => sp.GetRequiredService<Store>());
+    }
+}
+
+/// <summary>
+/// Real wiring, one thing faked -- the whole of what LIB_SERVICES used to do,
+/// in ordinary C#.
+///
+/// This is the shape the host's removal message points operators at. It
+/// composes the REAL composition root (Registration.AddCsLib, an extension
+/// method, which is also why this doubles as the case proving a registrar can
+/// be one) and then replaces exactly one registration.
+///
+/// Note what the JSON map could not have said and this does: the lifetime is
+/// chosen here. The map always registered Singleton, so substituting a
+/// Transient dependency silently changed its semantics as well as its
+/// implementation.
+/// </summary>
+public static class FakeStampStartup
+{
+    public static void Configure(IServiceCollection services)
+    {
+        services.AddCsLib();
+        services.Replace(ServiceDescriptor.Singleton<IStamp, FakeStamp>());
     }
 }
 
