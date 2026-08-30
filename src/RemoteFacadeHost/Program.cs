@@ -1,3 +1,4 @@
+using System.Runtime.Loader;
 using RemoteFacadeHost;
 
 var dir      = Environment.GetEnvironmentVariable("LIB_DIR") ?? "/plugin";
@@ -35,14 +36,30 @@ foreach (var (gone, removedIn) in ((string Name, string Version)[])
 // wire up a cifs mount when the env vars are set
 ShareMounter.MountIfConfigured();
 
+// Every resolution decision below reads the plugin's own deps.json, so its
+// absence is settled here -- before anything has been loaded and while the
+// message can still name the real problem. See PluginLoader for what loading
+// without it silently does instead.
+PluginLoader.RequireDependencyFile(dir, asmFile);
+
+// Constructed from the ASSEMBLY path, not the deps.json path just validated:
+// AssemblyDependencyResolver takes "the path to the component's managed entry
+// point" and derives the deps.json name from it. Handing it the deps.json
+// instead makes it look for <name>.deps.json.deps.json, find nothing, and
+// resolve nothing -- silently, because resolving nothing is also what it does
+// for a library that genuinely declares no assets. Caught by the native case
+// in test/run.sh that runs with no LD_LIBRARY_PATH; every other case was
+// covered by the entrypoint script's search path and stayed green.
+var deps = new AssemblyDependencyResolver(Path.Combine(dir, asmFile));
+
 // Before the plugin is loaded, not after: a type initializer can P/Invoke on
 // the very first touch, and the resolver has to be subscribed by then or that
 // first load fails with nothing to catch it.
-NativeResolver.Install(dir);
+NativeResolver.Install(dir, deps);
 
 // Fail before serving. A host that starts without a usable graph would make
 // every test using it fail confusingly at first call instead of at startup.
-PluginLoader.LoadAssembly(dir, asmFile);
+PluginLoader.LoadAssembly(dir, asmFile, deps);
 
 // One graph serves every call for the container's lifetime; that is what
 // allows a method to acquire a resource and a later call to release it.

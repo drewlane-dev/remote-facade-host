@@ -9,13 +9,21 @@ namespace RemoteFacadeHost;
 ///
 /// THE PROBLEM. This process is launched as RemoteFacadeHost.dll, so the CLR
 /// builds its native search list (NATIVE_DLL_SEARCH_DIRECTORIES) from the
-/// HOST's .deps.json, once, at startup. A plugin arrives later via
-/// Assembly.LoadFrom and contributes nothing to that list -- so the
-/// runtimes/{rid}/native directory sitting right next to the plugin is never
-/// probed. Only two directories are: the shared framework's, and the
-/// assembly's own. A package like LibGit2Sharp then dies in its type
-/// initializer with a DllNotFoundException the first time anything touches a
-/// repository, and nothing about that message points at the real cause.
+/// HOST's .deps.json, once, at startup. A plugin arrives later and contributes
+/// nothing to that list -- so the runtimes/{rid}/native directory sitting right
+/// next to the plugin is never probed. A package like LibGit2Sharp then dies in
+/// its type initializer with a DllNotFoundException the first time anything
+/// touches a repository, and nothing about that message points at the real
+/// cause.
+///
+/// THE FIX. The plugin's OWN deps.json describes those assets, including which
+/// RID each belongs to, and AssemblyDependencyResolver reads it. That replaces
+/// what this class used to do by hand: build a RID fallback chain, look for
+/// runtimes/&lt;rid&gt;/native directories under the plugin, and try each
+/// candidate file name in turn. Measured against that version, with nothing on
+/// LD_LIBRARY_PATH: deps.json resolved 'git2-5853918' straight to
+/// runtimes/linux-musl-arm64/native/libgit2-5853918.so, picking the RID itself
+/// and applying the lib/.so decoration itself.
 ///
 /// WHY THIS HOOK AND NOT ANOTHER. Three other options were tried and rejected:
 ///
@@ -38,19 +46,23 @@ namespace RemoteFacadeHost;
 /// last resort, only after that resolver has declined AND default probing has
 /// failed, so it cannot mask a library that would have loaded normally; and it
 /// hands back a handle directly, so the missing SONAME is irrelevant.
+///
+/// It also does NOT replace entrypoint.sh. This hook only sees loads the CLR
+/// performs; one native library dlopen()ing a sibling directly never passes
+/// through it, which is the case that script exists for.
 /// </summary>
 public static class NativeResolver
 {
     private static bool _installed;
-    private static string[] _probeDirs = [];
     private static string _pluginDir = "";
+    private static AssemblyDependencyResolver? _deps;
 
     /// <summary>
     /// Subscribes the resolver for a plugin directory. Idempotent: a second
     /// call is ignored rather than stacking another handler, so a later
     /// reload path cannot make resolution order depend on subscription order.
     /// </summary>
-    public static void Install(string pluginDir)
+    public static void Install(string pluginDir, AssemblyDependencyResolver deps)
     {
         if (_installed) return;
         _installed = true;
@@ -58,46 +70,12 @@ public static class NativeResolver
         _pluginDir = Directory.Exists(pluginDir)
             ? Path.TrimEndingDirectorySeparator(Path.GetFullPath(pluginDir)) + Path.DirectorySeparatorChar
             : "";
-        _probeDirs = ProbeDirs(pluginDir).ToArray();
+        _deps = deps;
 
-        // One line at startup, so a container that later fails to load a
-        // native library has the "what did it even look at" answer already in
-        // its log rather than requiring a rerun to find out.
         Console.Error.WriteLine(
-            $"[native] rid={RuntimeInformation.RuntimeIdentifier} " +
-            (_probeDirs.Length == 0
-                ? $"no native asset directories under {pluginDir}"
-                : $"probing: {string.Join(", ", _probeDirs)}"));
+            $"[native] rid={RuntimeInformation.RuntimeIdentifier} resolving from the plugin's deps.json");
 
         AssemblyLoadContext.Default.ResolvingUnmanagedDll += Resolve;
-    }
-
-    /// <summary>
-    /// Directories to search, most specific first: this runtime's own RID,
-    /// then the plugin root itself (where a RID-specific `dotnet publish`
-    /// puts native assets instead of under runtimes/).
-    /// </summary>
-    private static IEnumerable<string> ProbeDirs(string pluginDir)
-    {
-        foreach (var rid in RidCandidates())
-        {
-            var d = Path.Combine(pluginDir, "runtimes", rid, "native");
-            if (Directory.Exists(d)) yield return d;
-        }
-
-        if (Directory.Exists(pluginDir)) yield return pluginDir;
-    }
-
-    internal static IEnumerable<string> RidCandidates()
-    {
-        var rid = RuntimeInformation.RuntimeIdentifier;
-        yield return rid;
-
-        // A package predating musl RIDs ships only linux-x64. Trying it costs
-        // one failed dlopen: musl's loader refuses a glibc-linked object with
-        // unresolved symbols, TryLoad returns false, and the search moves on.
-        // It cannot half-load and crash.
-        if (rid.Contains("-musl-")) yield return rid.Replace("-musl-", "-");
     }
 
     /// <summary>
@@ -108,16 +86,10 @@ public static class NativeResolver
     /// </summary>
     private static nint Resolve(Assembly requesting, string name)
     {
-        foreach (var dir in _probeDirs)
+        if (_deps?.ResolveUnmanagedDllToPath(name) is { } path
+            && NativeLibrary.TryLoad(path, out var handle))
         {
-            foreach (var file in FileNames(name))
-            {
-                var candidate = Path.Combine(dir, file);
-                if (File.Exists(candidate) && NativeLibrary.TryLoad(candidate, out var handle))
-                {
-                    return handle;
-                }
-            }
+            return handle;
         }
 
         // Report a miss ONLY for an assembly that came from the plugin
@@ -133,13 +105,31 @@ public static class NativeResolver
             Console.Error.WriteLine(
                 $"[native] could not resolve '{name}' requested by " +
                 $"{requesting.GetName().Name}; rid={RuntimeInformation.RuntimeIdentifier}; " +
-                (_probeDirs.Length == 0
-                    ? "no native asset directories were found next to the plugin"
-                    : $"searched: {string.Join(", ", _probeDirs)}"));
+                Explain());
         }
 
         return nint.Zero;
     }
+
+    /// <summary>
+    /// Why one native name did not resolve.
+    ///
+    /// Deliberately does NOT claim to know which of the two causes it was.
+    /// ResolveUnmanagedDllToPath returns null both when deps.json declares no
+    /// such asset for this rid AND when it declares one whose file is not on
+    /// disk -- the documented behaviour, and confirmed by the native case in
+    /// test/run.sh that deletes runtimes/ while keeping deps.json: it reports
+    /// "not declared", not "declared but missing". Telling them apart would
+    /// mean parsing deps.json here by hand, which is the work this class
+    /// stopped doing. Naming both possibilities is honest and still actionable;
+    /// asserting the wrong one would not be.
+    /// </summary>
+    internal static string Explain(AssemblyDependencyResolver? deps = null) =>
+        (deps ?? _deps) is null
+            ? "the plugin's dependency file was never loaded"
+            : "the plugin's deps.json does not resolve it for this rid -- either no package " +
+              "in the plugin ships that asset for this rid, or one declares it and the file " +
+              "is absent from the publish";
 
     /// <summary>
     /// Extra detail to append to an error message, but ONLY when the failure
@@ -164,7 +154,7 @@ public static class NativeResolver
         {
             if (e is DllNotFoundException dll)
             {
-                return DescribeMiss(dll, RuntimeInformation.RuntimeIdentifier, _probeDirs, _pluginDir);
+                return DescribeMiss(dll, RuntimeInformation.RuntimeIdentifier, Explain());
             }
         }
 
@@ -180,15 +170,9 @@ public static class NativeResolver
     /// that went through it could run exactly once per process and would leave
     /// the resolver installed for every test after it.
     /// </summary>
-    internal static string DescribeMiss(
-        DllNotFoundException dll, string rid, IReadOnlyList<string> probeDirs, string pluginDir) =>
-        $" [native library {LibraryName(dll)} could not be loaded: host rid={rid}; " +
-        (probeDirs.Count == 0
-            ? $"no native asset directories were found under {pluginDir}. " +
-              "Publish the plugin so its runtimes/<rid>/native folder travels with it."
-            : $"searched {string.Join(", ", probeDirs)}. " +
-              $"The plugin needs a build carrying native assets for {rid}.") +
-        "]";
+    internal static string DescribeMiss(DllNotFoundException dll, string rid, string explanation) =>
+        $" [native library '{LibraryName(dll)}' could not be loaded: host rid={rid}; " +
+        explanation + "]";
 
     /// <summary>
     /// The quoted library name out of a DllNotFoundException, or "" if the
@@ -208,7 +192,7 @@ public static class NativeResolver
         if (open < 0) return "";
 
         var close = msg.IndexOf('\'', open + 1);
-        return close < 0 ? "" : $"'{msg[(open + 1)..close]}'";
+        return close < 0 ? "" : msg[(open + 1)..close];
     }
 
     /// <summary>
@@ -220,18 +204,4 @@ public static class NativeResolver
         _pluginDir.Length > 0
         && !string.IsNullOrEmpty(asm.Location)
         && Path.GetFullPath(asm.Location).StartsWith(_pluginDir, StringComparison.Ordinal);
-
-    /// <summary>
-    /// Name variants for one DllImport name. A P/Invoke of "git2-6777db8"
-    /// must find "libgit2-6777db8.so"; the runtime applies these
-    /// decorations during its own probing, and having declined that probing
-    /// we have to apply them ourselves.
-    /// </summary>
-    internal static IEnumerable<string> FileNames(string name)
-    {
-        yield return name;
-        yield return $"{name}.so";
-        yield return $"lib{name}.so";
-        yield return $"lib{name}";
-    }
 }

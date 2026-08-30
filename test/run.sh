@@ -463,6 +463,42 @@ api stampreal /invoke -X POST -H 'Content-Type: application/json' \
   -d '{"service":"CsLib.Store","method":"Stamp","args":[]}' | grep -q '"result":"real"' \
   && ok "resolves the registered implementation" || bad "resolves the registered implementation"
 
+echo "== a plugin without a usable deps.json is refused at startup =="
+# The host resolves the plugin's RID-specific assemblies and native assets from
+# its deps.json. Without a usable one, AssemblyDependencyResolver resolves
+# nothing and every package falls back to the copy in the plugin root -- which
+# for Microsoft.Data.SqlClient is a stub whose members throw. Measured before
+# this guard existed: the container started, reported HEALTHY, and the first
+# call returned {"ok":false,"error":"Microsoft.Data.SqlClient is not supported
+# on this platform."} -- a message that reads as a database fault, arriving
+# arbitrarily long after the real mistake.
+#
+# Both shapes are covered because they fail differently and File.Exists only
+# catches the first: the file absent, and the file present but describing
+# nothing.
+DEPSDIR="$(mktemp -d)"
+cp -r "${HERE}/publish/cslib" "$DEPSDIR/none"
+rm -f "$DEPSDIR/none/CsLib.deps.json"
+cp -r "${HERE}/publish/cslib" "$DEPSDIR/empty"
+echo '{}' > "$DEPSDIR/empty/CsLib.deps.json"
+
+for shape in none empty; do
+  docker run -d --name "deps-${NET}" --network "${NET}" \
+    -v "$DEPSDIR/$shape:/plugin:ro" \
+    -e LIB_DIR=/plugin -e LIB_ASSEMBLY=CsLib.dll \
+    -e LIB_REGISTRAR=CsLib.SqlProbeStartup.Configure \
+    "$IMAGE" >/dev/null 2>&1
+  if code="$(wait_stopped "deps-${NET}")" && [ "$code" -ne 0 ] \
+     && docker logs "deps-${NET}" 2>&1 | grep -q "CsLib.deps.json"; then
+    ok "a plugin whose deps.json is '$shape' is refused at startup, naming the file"
+  else
+    docker logs "deps-${NET}" 2>&1 | tail -4
+    bad "a plugin whose deps.json is '$shape' is refused at startup, naming the file"
+  fi
+  docker rm -f "deps-${NET}" >/dev/null 2>&1 || true
+done
+rm -rf "$DEPSDIR"
+
 echo "== a removed configuration variable is refused, not ignored =="
 # Nothing covered this before: the guard in Program.cs that rejects LIB_TYPE
 # and LIB_OPTIONS had no test at any level, so deleting it would have broken
@@ -1044,12 +1080,18 @@ if wait_healthy natstrip; then
   # "The type initializer for 'LibGit2Sharp.Core.NativeMethods' threw an
   # exception", which names neither the library nor the reason, and the real
   # cause sits two levels down an InnerException chain no test output shows.
+  #
+  # This case deletes runtimes/ but KEEPS deps.json, and it is why the message
+  # names both causes instead of picking one: ResolveUnmanagedDllToPath returns
+  # null here exactly as it does for an asset that was never declared, so a
+  # message asserting "declared but missing" would be wrong precisely when it
+  # mattered. Measured -- an earlier version of this assertion failed on it.
   if echo "$STRIP_OUT" | grep -q "native library" \
      && echo "$STRIP_OUT" | grep -q "rid=" \
-     && echo "$STRIP_OUT" | grep -q "searched"; then
-    ok "the failure names the library, the host rid, and the directories searched"
+     && echo "$STRIP_OUT" | grep -q "deps.json does not resolve it"; then
+    ok "the failure names the library, the host rid, and what to check"
   else
-    bad "the failure names the library, the host rid, and the directories searched (got: $STRIP_OUT)"
+    bad "the failure names the library, the host rid, and what to check (got: $STRIP_OUT)"
   fi
 else
   bad "with native assets removed the SAME call fails (never healthy)"

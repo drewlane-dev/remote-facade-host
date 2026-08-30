@@ -1,3 +1,4 @@
+using System.Runtime.Loader;
 using RemoteFacadeHost;
 
 namespace RemoteFacade.UnitTests;
@@ -11,45 +12,8 @@ namespace RemoteFacade.UnitTests;
 /// </summary>
 public class NativeResolverTests
 {
-    [Fact]
-    public void The_running_rid_is_always_tried_first()
-    {
-        var rid = System.Runtime.InteropServices.RuntimeInformation.RuntimeIdentifier;
-        Assert.Equal(rid, NativeResolver.RidCandidates().First());
-    }
-
-    [Fact]
-    public void A_musl_rid_falls_back_to_its_glibc_spelling()
-    {
-        // Only meaningful on musl, which is what the image runs. Asserted as a
-        // property of the transformation so it holds on either host.
-        var candidates = NativeResolver.RidCandidates().ToList();
-        var rid = candidates[0];
-
-        if (rid.Contains("-musl-"))
-        {
-            Assert.Contains(rid.Replace("-musl-", "-"), candidates);
-        }
-        else
-        {
-            Assert.Single(candidates);
-        }
-    }
-
-    [Fact]
-    public void A_dll_import_name_is_tried_with_the_lib_prefix_and_so_suffix()
-    {
-        // The variant that matters: LibGit2Sharp imports "git2-5853918" and
-        // the file on disk is "libgit2-5853918.so".
-        var names = NativeResolver.FileNames("git2-5853918").ToList();
-
-        Assert.Contains("git2-5853918", names);
-        Assert.Contains("libgit2-5853918.so", names);
-        Assert.Contains("git2-5853918.so", names);
-    }
-
     [Theory]
-    [InlineData("Unable to load shared library 'git2-5853918' or one of its dependencies.", "'git2-5853918'")]
+    [InlineData("Unable to load shared library 'git2-5853918' or one of its dependencies.", "git2-5853918")]
     [InlineData("no quotes here at all", "")]
     [InlineData("one 'unterminated quote", "")]
     public void The_library_name_is_lifted_out_of_the_runtime_s_message(string message, string expected)
@@ -58,31 +22,31 @@ public class NativeResolverTests
     }
 
     [Fact]
-    public void A_miss_names_the_library_the_rid_and_every_directory_searched()
+    public void A_miss_names_the_library_the_rid_and_the_reason()
     {
         var hint = NativeResolver.DescribeMiss(
             new DllNotFoundException("Unable to load shared library 'git2-abc' or one of its dependencies."),
             "linux-musl-x64",
-            ["/plugin/runtimes/linux-musl-x64/native", "/plugin"],
-            "/plugin");
+            "the plugin's deps.json declares no native asset by that name for this rid");
 
         Assert.Contains("'git2-abc'", hint);
         Assert.Contains("linux-musl-x64", hint);
-        Assert.Contains("/plugin/runtimes/linux-musl-x64/native", hint);
+        Assert.Contains("declares no native asset", hint);
     }
 
     [Fact]
-    public void With_no_native_directories_the_message_points_at_the_publish_instead()
+    public void A_miss_names_both_causes_rather_than_guessing_between_them()
     {
-        // A different fault with a different fix: nothing was found to search,
-        // so telling the reader which directories were searched would be
-        // useless and telling them to check the publish is actionable.
-        var hint = NativeResolver.DescribeMiss(
-            new DllNotFoundException("Unable to load shared library 'git2-abc'."),
-            "linux-musl-x64", [], "/plugin");
+        // ResolveUnmanagedDllToPath returns null for "deps.json declares no
+        // such asset for this rid" AND for "it declares one that is not on
+        // disk". An earlier version of this message asserted the first; the
+        // container case that deletes runtimes/ while KEEPING deps.json proved
+        // it wrong, because that is the second and it still reported the first.
+        var explained = NativeResolver.Explain(
+            new AssemblyDependencyResolver(typeof(NativeResolverTests).Assembly.Location));
 
-        Assert.Contains("no native asset directories", hint);
-        Assert.Contains("Publish the plugin", hint);
+        Assert.Contains("no package in the plugin ships that asset", explained);
+        Assert.Contains("absent from the publish", explained);
     }
 
     [Fact]

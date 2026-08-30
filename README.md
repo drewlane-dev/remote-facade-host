@@ -115,7 +115,7 @@ sequenceDiagram
 |---|---|---|
 | `LIB_ASSEMBLY` | **required** | Assembly file name inside `LIB_DIR`, e.g. `MyApp.dll`. |
 | `LIB_REGISTRAR` | **required** | `Namespace.Type.Method` — a static method taking an `IServiceCollection`. Unset is a fatal startup error. |
-| `LIB_DIR` | `/plugin` | Directory containing the publish output. |
+| `LIB_DIR` | `/plugin` | Directory containing the publish output. Must include the plugin's `.deps.json`; the host resolves dependencies and native assets from it and refuses to start without one. |
 | `LIB_PORT` | `8080` | Port to listen on. |
 
 ### Mounting an SMB share
@@ -302,11 +302,14 @@ than an image one. The image ships ICU and turns invariant mode off.
 
 **RID-specific assemblies resolve too.** A package that ships a reference stub
 at its root and the real build under `runtimes/<rid>/lib` — `Microsoft.Data.SqlClient`
-is the common one — works without configuration. Those are normally chosen from
-the app's `deps.json`, which a plugin loaded by `Assembly.LoadFrom` never gets,
-so the host preloads them from the plugin's own `runtimes` folder before
-loading it. Without that, SqlClient's root stub loads and every call fails with
-*"Microsoft.Data.SqlClient is not supported on this platform."*
+is the common one — works without configuration. Both these and native assets
+are resolved from **the plugin's own `deps.json`**, which is why that file is
+required: without a usable one the host would fall back to the copy in the
+plugin root and every SqlClient call would fail with *"Microsoft.Data.SqlClient
+is not supported on this platform."* — long after a healthy startup, reading as
+a database fault rather than a packaging one. A missing or empty `deps.json` is
+therefore a fatal startup error naming the file. `dotnet publish` always emits
+one; mount its output rather than a project or `bin` directory.
 
 **A plugin cannot add routes.** The host serves its API from an MVC controller,
 and MVC finds controllers by convention — any public class whose name ends in
