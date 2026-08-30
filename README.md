@@ -290,6 +290,13 @@ so the host preloads them from the plugin's own `runtimes` folder before
 loading it. Without that, SqlClient's root stub loads and every call fails with
 *"Microsoft.Data.SqlClient is not supported on this platform."*
 
+**A plugin cannot add routes.** The host serves its API from an MVC controller,
+and MVC finds controllers by convention — any public class whose name ends in
+`Controller`, no base class or attribute required. Discovery is scoped to the
+host's own assembly, so a controller-shaped type in *your* library is never
+routed, and cannot shadow `/invoke` or `/health`. `test/run.sh` proves it
+against a fixture carrying exactly such a type.
+
 **Host and plugin share a load context.** So `typeof(IOptions<>)` means the
 same thing on both sides and constructor matching works. The cost: you must
 agree on versions of shared packages (`Microsoft.Extensions.*`). A mismatch
@@ -314,7 +321,7 @@ dotnet test test/integration/RemoteFacade.IntegrationTests/RemoteFacade.Integrat
 
 | Suite | Covers | Why it can't be one of the others |
 |---|---|---|
-| unit | logic — `InstanceHolder`, `Invoker`, `NativeResolver`, the client | Reset-during-a-call and racing resets can't be timed reliably over HTTP; a test that hopes the interleaving lands proves nothing when it passes. |
+| unit | logic — `InstanceHolder`, `Invoker`, `NativeResolver`, the client — plus the endpoints themselves, both as plain method calls and over a real in-process pipeline | Reset-during-a-call and racing resets can't be timed reliably over HTTP; a test that hopes the interleaving lands proves nothing when it passes. The endpoint cases need no plugin and no Docker, so every `/invoke` rejection branch is reachable in milliseconds. |
 | `test/run.sh` | the wire, with `curl` | Only a byte comparison against the previous release catches a dropped field. |
 | integration | the composition path through `RemoteHost` | `run.sh` speaks the protocol with `curl`, so it never exercises the client package consumers depend on. |
 

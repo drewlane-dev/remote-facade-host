@@ -1017,3 +1017,23 @@ public static class GlobalizationProbeStartup
     public static void Configure(IServiceCollection services) =>
         services.AddSingleton<IGlobalizationProbe, GlobalizationProbe>();
 }
+
+/// <summary>
+/// A controller-shaped type in a PLUGIN, which must never be served.
+///
+/// The host serves its API from an MVC controller, and MVC discovers
+/// controllers BY CONVENTION: ControllerFeatureProvider.IsController accepts
+/// any public, non-abstract, non-generic class whose name ends in "Controller",
+/// with no base class and no attribute required -- which is why this type can
+/// exist here without CsLib referencing any part of ASP.NET Core.
+///
+/// Discovery is scoped to the host's registered application parts, and a plugin
+/// loaded by Assembly.LoadFrom is not one. That is the property under test: a
+/// third-party assembly this image loads must not be able to add, replace or
+/// shadow a route on the host that loaded it. Nothing enforced this while the
+/// endpoints were minimal-API lambdas, because there was no discovery at all.
+/// </summary>
+public sealed class HijackController
+{
+    public string Index() => "the plugin answered a route it should not have";
+}

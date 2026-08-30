@@ -114,6 +114,34 @@ echo "== /types is a usable diagnostic =="
 api cs /types | grep -q "CsLib.Store" \
   && ok "/types lists the assembly's types" || bad "/types lists the assembly's types"
 
+echo "== a plugin cannot add routes to the host that loaded it =="
+# The host serves its API from an MVC controller, and MVC finds controllers by
+# CONVENTION -- any public class whose name ends in "Controller". CsLib carries
+# exactly such a type (CsLib.HijackController) with no ASP.NET Core reference of
+# its own, so this asks the real question: can a loaded plugin get a route
+# served? Discovery is scoped to the host's application parts, and a plugin
+# loaded by Assembly.LoadFrom is not one.
+#
+# Vacuity guard: /types must actually list the type, or a 404 below would prove
+# only that the fixture failed to publish.
+api cs /types | grep -q "CsLib.HijackController" \
+  && ok "the hijack fixture really is in the loaded assembly" \
+  || bad "the hijack fixture really is in the loaded assembly"
+
+hijack_code=$(api cs /hijack -o /dev/null -w '%{http_code}')
+hijack_index=$(api cs /Hijack/Index -o /dev/null -w '%{http_code}')
+if [ "$hijack_code" = "404" ] && [ "$hijack_index" = "404" ]; then
+  ok "a controller-shaped type in a plugin is not routed"
+else
+  bad "a controller-shaped type in a plugin is not routed (/hijack=$hijack_code /Hijack/Index=$hijack_index)"
+fi
+
+# The host's own five routes are the whole surface. A plugin type that shadowed
+# one of them would show up here as a changed body, not as a new route.
+api cs /health | grep -q '"registrar":"CsLib.StoreStartup.Configure"' \
+  && ok "the host's own routes are unaffected by a plugin's controller-shaped type" \
+  || bad "the host's own routes are unaffected by a plugin's controller-shaped type"
+
 echo "== all four return shapes over /invoke =="
 CLIENT_OUT=$(docker run --rm --network "${NET}" -v "${HERE}/..:/w" -w /w \
   mcr.microsoft.com/dotnet/sdk:10.0 \
