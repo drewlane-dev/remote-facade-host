@@ -276,6 +276,14 @@ proxies you already hold keep working, because services resolve per call.
 is `linux-musl-*`; a package shipping only `linux-x64` will not load, and the
 error says so, naming the library and every directory searched.
 
+**RID-specific assemblies resolve too.** A package that ships a reference stub
+at its root and the real build under `runtimes/<rid>/lib` — `Microsoft.Data.SqlClient`
+is the common one — works without configuration. Those are normally chosen from
+the app's `deps.json`, which a plugin loaded by `Assembly.LoadFrom` never gets,
+so the host preloads them from the plugin's own `runtimes` folder before
+loading it. Without that, SqlClient's root stub loads and every call fails with
+*"Microsoft.Data.SqlClient is not supported on this platform."*
+
 **Host and plugin share a load context.** So `typeof(IOptions<>)` means the
 same thing on both sides and constructor matching works. The cost: you must
 agree on versions of shared packages (`Microsoft.Extensions.*`). A mismatch

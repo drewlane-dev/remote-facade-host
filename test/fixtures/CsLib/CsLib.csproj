@@ -8,6 +8,13 @@
     <PackageReference Include="Microsoft.Extensions.Options" Version="10.0.0" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.0" />
     <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.0" />
+    <!--
+      Present only to exercise RID-specific MANAGED asset resolution. This
+      package ships a stub at the package root and its real implementation
+      under runtimes/unix/lib, which is exactly the shape a plugin loader can
+      get wrong.
+    -->
+    <PackageReference Include="Microsoft.Data.SqlClient" Version="7.0.2" />
   </ItemGroup>
 
   <ItemGroup>

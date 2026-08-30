@@ -948,3 +948,34 @@ public static class EchoStockStartup
         services.AddSingleton<IOptionsEcho, OptionsEcho>();
     }
 }
+
+/// <summary>
+/// Proves which Microsoft.Data.SqlClient the container actually loaded.
+///
+/// Constructing a SqlConnection is enough and needs no database: the stub that
+/// ships at the package root throws "Microsoft.Data.SqlClient is not supported
+/// on this platform" from its constructor, while the real implementation under
+/// runtimes/unix/lib constructs fine. So the two outcomes are unambiguous.
+/// </summary>
+public interface ISqlProbe
+{
+    string Describe();
+}
+
+public sealed class SqlProbe : ISqlProbe
+{
+    public string Describe()
+    {
+        // Never opened. The point is which assembly answered, not whether a
+        // server is reachable.
+        using var connection = new Microsoft.Data.SqlClient.SqlConnection();
+        var assembly = connection.GetType().Assembly;
+        return $"{assembly.GetName().Version}|{assembly.Location}";
+    }
+}
+
+public static class SqlProbeStartup
+{
+    public static void Configure(IServiceCollection services) =>
+        services.AddSingleton<ISqlProbe, SqlProbe>();
+}
