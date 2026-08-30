@@ -52,11 +52,6 @@ PluginLoader.RequireDependencyFile(dir, asmFile);
 // covered by the entrypoint script's search path and stayed green.
 var deps = new AssemblyDependencyResolver(Path.Combine(dir, asmFile));
 
-// Before the plugin is loaded, not after: a type initializer can P/Invoke on
-// the very first touch, and the resolver has to be subscribed by then or that
-// first load fails with nothing to catch it.
-NativeResolver.Install(dir, deps);
-
 // Fail before serving. A host that starts without a usable graph would make
 // every test using it fail confusingly at first call instead of at startup.
 PluginLoader.LoadAssembly(dir, asmFile, deps);

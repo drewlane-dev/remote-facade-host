@@ -1045,18 +1045,8 @@ if wait_healthy nat; then
     bad "a plugin's native assets load with NO consumer configuration (got: $NAT_OUT)"
   fi
 
-  # The startup line is expected; a miss line is not. This is the guard for a
-  # regression that made every container log two msquic misses per boot,
-  # because the shared framework probes for optional native libraries and
-  # those declines are normal.
-  if docker logs "nat-${NET}" 2>&1 | grep -q "could not resolve"; then
-    bad "a successful native load logs no resolver misses"
-  else
-    ok "a successful native load logs no resolver misses"
-  fi
 else
   bad "a plugin's native assets load with NO consumer configuration (never healthy)"
-  bad "a successful native load logs no resolver misses (never healthy)"
 fi
 
 # Vacuity control. Without it, the case above could be passing because the
@@ -1081,14 +1071,14 @@ if wait_healthy natstrip; then
   # exception", which names neither the library nor the reason, and the real
   # cause sits two levels down an InnerException chain no test output shows.
   #
-  # This case deletes runtimes/ but KEEPS deps.json, and it is why the message
-  # names both causes instead of picking one: ResolveUnmanagedDllToPath returns
-  # null here exactly as it does for an asset that was never declared, so a
-  # message asserting "declared but missing" would be wrong precisely when it
-  # mattered. Measured -- an earlier version of this assertion failed on it.
+  # runtimes/ is gone, but the search path is NOT empty: the entrypoint also
+  # adds the plugin root, because a RID-specific publish flattens native assets
+  # into it. So this is the "searched, found nothing" fault, and the case below
+  # that bypasses the entrypoint is the "nothing to search" one. Two different
+  # fixes, which is why the message distinguishes them.
   if echo "$STRIP_OUT" | grep -q "native library" \
      && echo "$STRIP_OUT" | grep -q "rid=" \
-     && echo "$STRIP_OUT" | grep -q "deps.json does not resolve it"; then
+     && echo "$STRIP_OUT" | grep -q "searched /plugin"; then
     ok "the failure names the library, the host rid, and what to check"
   else
     bad "the failure names the library, the host rid, and what to check (got: $STRIP_OUT)"
@@ -1100,26 +1090,35 @@ fi
 docker rm -f "natstrip-${NET}" >/dev/null 2>&1 || true
 rm -rf "$(dirname "$STRIP")"
 
-# The managed resolver on its own, with the entrypoint script bypassed so
-# nothing is on LD_LIBRARY_PATH. The two layers cover different failures --
-# the script exists for native-to-native dlopen, which no managed hook sees --
-# so proving only the combination works would leave either one free to rot.
-docker run -d --rm --name "natmgd-${NET}" --network "${NET}" --network-alias natmgd \
+# The entrypoint is what makes native assets findable, so bypassing it must
+# FAIL. This replaces a case asserting the opposite: a managed
+# ResolvingUnmanagedDll hook used to resolve them with nothing on
+# LD_LIBRARY_PATH. That hook was removed once it was measured never to fire
+# while the entrypoint ran -- it fires only after default probing fails, and
+# default probing is dlopen, which reads the very path the entrypoint sets.
+#
+# Asserted rather than left untested because it is now a real constraint on
+# consumers: --entrypoint dotnet, or any orchestrator that overrides the
+# entrypoint, loses native assets.
+docker run -d --rm --name "natbypass-${NET}" --network "${NET}" --network-alias natbypass \
   --entrypoint dotnet \
   -v "${HERE}/publish/nativelib:/plugin:ro" \
   -e LIB_DIR=/plugin -e LIB_ASSEMBLY=NativeLib.dll \
   -e LIB_REGISTRAR=NativeLib.NativeStartup.Configure \
   -e DOTNET_EnableDiagnostics=0 "$IMAGE" \
   /app/RemoteFacadeHost.dll >/dev/null 2>&1
-if wait_healthy natmgd; then
-  MGD_OUT=$(api natmgd /invoke -X POST -H 'Content-Type: application/json' -d '{"service":"NativeLib.IGitProbe","method":"InitAndCommit","args":["/tmp/natrepo"]}')
-  echo "$MGD_OUT" | grep -qE '"result":"[0-9a-f]{40}"' \
-    && ok "the managed resolver alone resolves native assets, with no LD_LIBRARY_PATH" \
-    || bad "the managed resolver alone resolves native assets (got: $MGD_OUT)"
+if wait_healthy natbypass; then
+  BYPASS_OUT=$(api natbypass /invoke -X POST -H 'Content-Type: application/json' -d '{"service":"NativeLib.IGitProbe","method":"InitAndCommit","args":["/tmp/natrepo"]}')
+  if echo "$BYPASS_OUT" | grep -q '"ok":false' \
+     && echo "$BYPASS_OUT" | grep -q "no native asset directories"; then
+    ok "bypassing the entrypoint loses native assets, and the error says why"
+  else
+    bad "bypassing the entrypoint loses native assets, and the error says why (got: $BYPASS_OUT)"
+  fi
 else
-  bad "the managed resolver alone resolves native assets (never healthy)"
+  bad "bypassing the entrypoint loses native assets (never healthy)"
 fi
-docker rm -f "natmgd-${NET}" >/dev/null 2>&1 || true
+docker rm -f "natbypass-${NET}" >/dev/null 2>&1 || true
 
 echo "== wire-format baseline vs the previous release =="
 if sh "${HERE}/baseline.sh" "${IMAGE}"; then

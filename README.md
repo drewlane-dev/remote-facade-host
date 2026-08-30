@@ -288,11 +288,22 @@ The error says so and names the service. Register it `Singleton` or
 a lock and a later call release it. `DELETE /instance` resets between tests;
 proxies you already hold keep working, because services resolve per call.
 
-**Native dependencies just work.** A plugin carrying `runtimes/<rid>/native`
-(LibGit2Sharp, SkiaSharp, SQLitePCLRaw) loads with no configuration — no
-`LD_LIBRARY_PATH`, no knowing the image's RID. The image is Alpine, so the RID
-is `linux-musl-*`; a package shipping only `linux-x64` will not load, and the
-error says so, naming the library and every directory searched.
+**Native dependencies just work — but don't override the entrypoint.** A
+plugin carrying `runtimes/<rid>/native` (LibGit2Sharp, SQLitePCLRaw) loads with
+no configuration on your side: the image's entrypoint puts those directories on
+`LD_LIBRARY_PATH` before the host starts, so you never set it and never need to
+know the image's RID. That script is the *only* mechanism — running with
+`--entrypoint dotnet`, or any orchestrator that replaces the entrypoint, leaves
+native assets unfindable. The error says so.
+
+The image is Alpine, so the RID is `linux-musl-*`; a package shipping only
+`linux-x64` will not load, and the error names the library, the RID and the
+path that was searched.
+
+Native assets that need *system* libraries are a separate matter, and this is
+not a general-purpose base image. SkiaSharp, for instance, does **not** work
+here: `libSkiaSharp.so` needs `libfontconfig.so.1`, which the image does not
+install, and no search path can supply it.
 
 **Globalization is enabled.** Alpine .NET images run in invariant mode by
 default, where anything culture-aware throws *"Globalization Invariant Mode is
