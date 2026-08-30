@@ -53,7 +53,7 @@ dotnet publish MyApp.csproj -o ./publish
 docker run -v "$(pwd)/publish:/plugin:ro" \
   -e LIB_ASSEMBLY=MyApp.dll \
   -e LIB_REGISTRAR=MyApp.TestStartup.Configure \
-  -p 8080:8080 ghcr.io/drewlane-dev/remote-facade-host:3.2.0
+  -p 8080:8080 ghcr.io/drewlane-dev/remote-facade-host:3.3.0
 ```
 
 Then drive it. With [Testcontainers](https://dotnet.testcontainers.org/), the
@@ -172,7 +172,7 @@ Testcontainers.
 
 ```csharp
 await using var container = new ContainerBuilder()
-    .WithImage("ghcr.io/drewlane-dev/remote-facade-host:3.2.0")
+    .WithImage("ghcr.io/drewlane-dev/remote-facade-host:3.3.0")
     .WithRemoteFacade(typeof(TestStartup), pluginDir)
     .WithOptions(new StoreOptions { RootPath = "/mnt/share" })
     .WithSmbMount(new SmbMount { Server = "samba", Share = "data" })
