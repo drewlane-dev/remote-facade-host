@@ -999,10 +999,16 @@ public sealed class GlobalizationProbe : IGlobalizationProbe
 {
     public string Describe()
     {
-        // Throws in invariant mode. In a working image it returns the real
-        // culture, whose currency symbol is not the invariant one.
+        // The AppContext switch, NOT just whether a culture resolves. Those
+        // are different signals: setting the env var makes cultures work while
+        // runtimeconfig.json can still say invariant, and the switch is what
+        // Microsoft.Data.SqlClient reads before refusing to connect. An earlier
+        // version of this probe asked only for a culture and passed against an
+        // image SqlClient would not work on.
+        AppContext.TryGetSwitch("System.Globalization.Invariant", out var invariant);
+
         var culture = System.Globalization.CultureInfo.GetCultureInfo("en-GB");
-        return $"{culture.Name}|{culture.NumberFormat.CurrencySymbol}";
+        return $"invariant={invariant}|{culture.Name}|{culture.NumberFormat.CurrencySymbol}";
     }
 }
 

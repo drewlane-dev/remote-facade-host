@@ -65,7 +65,9 @@ public class RidAssetTests
         // present rather than a stub culture.
         var described = probe.Describe();
 
-        Assert.StartsWith("en-GB|", described);
-        Assert.Contains("\u00A3", described.Replace("£", "\u00A3"));
+        // The switch is the assertion that matters: a culture resolving is a
+        // weaker signal that passes on an image SqlClient cannot connect from.
+        Assert.StartsWith("invariant=False|", described);
+        Assert.Contains("en-GB", described);
     }
 }

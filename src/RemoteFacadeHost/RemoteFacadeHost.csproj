@@ -1,9 +1,18 @@
 <Project Sdk="Microsoft.NET.Sdk.Web">
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
+    <!--
+      The Alpine SDK bakes System.Globalization.Invariant=true into
+      runtimeconfig.json, and that AppContext switch is what
+      Microsoft.Data.SqlClient reads. Installing ICU and setting the
+      DOTNET_SYSTEM_GLOBALIZATION_INVARIANT env var is NOT enough: cultures
+      then resolve, so a naive probe passes, while the switch SqlClient checks
+      still says invariant and it refuses to connect.
+    -->
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-    <InvariantGlobalization>true</InvariantGlobalization>
+    <InvariantGlobalization>false</InvariantGlobalization>
+    <PredefinedCulturesOnly>false</PredefinedCulturesOnly>
   </PropertyGroup>
   <ItemGroup>
     <!-- Shared with plugins so type identities unify in the default load context.
