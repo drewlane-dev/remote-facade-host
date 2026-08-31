@@ -113,10 +113,16 @@ sequenceDiagram
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `LIB_ASSEMBLY` | **required** | Assembly file name inside `LIB_DIR`, e.g. `MyApp.dll`. |
+| `LIB_ASSEMBLY` | **required** | Assembly file name inside `/plugin`, e.g. `MyApp.dll`. |
 | `LIB_REGISTRAR` | **required** | `Namespace.Type.Method` — a static method taking an `IServiceCollection`. Unset is a fatal startup error. |
-| `LIB_DIR` | `/plugin` | Directory containing the publish output. Must include the plugin's `.deps.json`; the host resolves dependencies and native assets from it and refuses to start without one. |
-| `LIB_PORT` | `8080` | Port to listen on. |
+
+Mount your publish output at **`/plugin`**, and the host listens on **8080**.
+Neither is configurable: `LIB_DIR` and `LIB_PORT` were removed in v4 because
+nothing set them and changing the port only desynchronised the container from
+`EXPOSE`, from the Testcontainers helper and from the `/health` wait. Map the
+port with Docker's own `-p`. The mounted directory must contain the plugin's
+`.deps.json` — the host resolves dependencies and native assets from it and
+refuses to start without one.
 
 ### Mounting an SMB share
 
@@ -183,7 +189,7 @@ await using var host = container.RemoteHost();
 
 | | |
 |---|---|
-| `WithRemoteFacade` | Bind mount, `LIB_DIR`, `LIB_ASSEMBLY`, `LIB_REGISTRAR`, a random port binding, and a wait on `/health` — not on the port, which is bound before the graph is built. Throws if the plugin directory does not exist, since a missing one bind-mounts as an empty one. Pass `transport: PluginTransport.Copy` when the **test itself** runs in a container: a bind mount there names a path on the Docker host, and the container silently gets an empty directory. |
+| `WithRemoteFacade` | Bind mount, `LIB_ASSEMBLY`, `LIB_REGISTRAR`, a random port binding, and a wait on `/health` — not on the port, which is bound before the graph is built. Throws if the plugin directory does not exist, since a missing one bind-mounts as an empty one. Pass `transport: PluginTransport.Copy` when the **test itself** runs in a container: a bind mount there names a path on the Docker host, and the container silently gets an empty directory. |
 | `WithOptions` | The same typed push-down as above, straight onto the builder. |
 | `WithSmbMount` | Credentials plus the privileges a cifs mount needs: `SYS_ADMIN`, `DAC_READ_SEARCH`, and `apparmor=unconfined`. Without them the mount fails with a message that mentions none of them. |
 | `RemoteHost()` | A client on the **mapped** port, so there is no hostname/port string to get subtly wrong. |

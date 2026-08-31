@@ -28,7 +28,8 @@
 # running host would affect child processes and nothing else.
 set -eu
 
-DIR="${LIB_DIR:-/plugin}"
+# Fixed: LIB_DIR was removed in v4, so this is the only plugin path.
+DIR="/plugin"
 
 # The image is Alpine, so musl -- but derive it rather than hardcode it, so
 # this keeps working if the base image is ever changed to a glibc one.

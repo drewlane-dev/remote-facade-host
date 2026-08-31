@@ -29,7 +29,7 @@ start_host() { # start_host <alias> <pluginDir> <assembly> <registrar> [storeRoo
   # back at /tmp directly.
   docker run -d --rm --name "$1-${NET}" --network "${NET}" --network-alias "$1" \
     -v "$2:/plugin:ro" \
-    -e LIB_DIR=/plugin -e LIB_ASSEMBLY="$3" -e LIB_REGISTRAR="$4" \
+    -e LIB_ASSEMBLY="$3" -e LIB_REGISTRAR="$4" \
     -e STORE_ROOT="${5:-/tmp}" \
     -e SENTINEL_PATH="${6:-}" \
     -e DOTNET_EnableDiagnostics=0 \
@@ -370,7 +370,7 @@ for n in ia ib; do
   docker run -d --rm --name "$n-${NET}" --network "${NET}" --network-alias "$n" \
     --cap-add SYS_ADMIN --cap-add DAC_READ_SEARCH --security-opt apparmor=unconfined \
     -v "${HERE}/publish/cslib:/plugin:ro" \
-    -e LIB_DIR=/plugin -e LIB_ASSEMBLY=CsLib.dll \
+    -e LIB_ASSEMBLY=CsLib.dll \
     -e LIB_REGISTRAR=CsLib.StoreStartup.Configure -e STORE_ROOT=/mnt/share \
     -e SMB_SERVER=samba -e SMB_SHARE=data \
     "$IMAGE" >/dev/null 2>&1
@@ -423,7 +423,7 @@ echo "== a misconfigured mount is fatal, not silently skipped =="
 # exit code can still be inspected after it exits.
 docker run -d --name "badhost-${NET}" --network "${NET}" \
   -v "${HERE}/publish/cslib:/plugin:ro" \
-  -e LIB_DIR=/plugin -e LIB_ASSEMBLY=CsLib.dll -e LIB_REGISTRAR=CsLib.StoreStartup.Configure \
+  -e LIB_ASSEMBLY=CsLib.dll -e LIB_REGISTRAR=CsLib.StoreStartup.Configure \
   --cap-add SYS_ADMIN --cap-add DAC_READ_SEARCH --security-opt apparmor=unconfined \
   -e SMB_SERVER=no-such-smb-host -e SMB_SHARE=data \
   "$IMAGE" >/dev/null 2>&1
@@ -442,7 +442,7 @@ docker rm -f "badhost-${NET}" >/dev/null 2>&1 || true
 # --cap-add here: this must fail before ever calling `mount`.
 docker run -d --name "badcfg-${NET}" --network "${NET}" \
   -v "${HERE}/publish/cslib:/plugin:ro" \
-  -e LIB_DIR=/plugin -e LIB_ASSEMBLY=CsLib.dll -e LIB_REGISTRAR=CsLib.StoreStartup.Configure \
+  -e LIB_ASSEMBLY=CsLib.dll -e LIB_REGISTRAR=CsLib.StoreStartup.Configure \
   -e SMB_SERVER=samba \
   "$IMAGE" >/dev/null 2>&1
 if code="$(wait_stopped "badcfg-${NET}")" && [ "$code" -ne 0 ]; then
@@ -485,7 +485,7 @@ echo '{}' > "$DEPSDIR/empty/CsLib.deps.json"
 for shape in none empty; do
   docker run -d --name "deps-${NET}" --network "${NET}" \
     -v "$DEPSDIR/$shape:/plugin:ro" \
-    -e LIB_DIR=/plugin -e LIB_ASSEMBLY=CsLib.dll \
+    -e LIB_ASSEMBLY=CsLib.dll \
     -e LIB_REGISTRAR=CsLib.SqlProbeStartup.Configure \
     "$IMAGE" >/dev/null 2>&1
   if code="$(wait_stopped "deps-${NET}")" && [ "$code" -ne 0 ] \
@@ -509,12 +509,24 @@ echo "== a removed configuration variable is refused, not ignored =="
 # LIB_SERVICES joins them: interface-to-implementation overrides are gone, and
 # a startup that composes another startup and calls Replace expresses the same
 # thing in ordinary C# (CsLib.FakeStampStartup, exercised below).
-for gone in LIB_TYPE LIB_OPTIONS LIB_SERVICES; do
+# NAME|VALUE, because the value that proves the point differs per variable:
+# a divergent one, not merely any one. LIB_DIR and LIB_PORT are the v4
+# additions -- both were real knobs that nothing ever turned, and both could
+# only break things if turned (LIB_PORT desynchronises from EXPOSE and from
+# WithRemoteFacade's hardcoded 8080; LIB_DIR from the bind mount the image
+# documents).
+for pair in 'LIB_TYPE|CsLib.Store' \
+            'LIB_OPTIONS|{"RootPath":"/tmp"}' \
+            'LIB_SERVICES|{"CsLib.IStamp":"CsLib.FakeStamp"}' \
+            'LIB_DIR|/somewhere-else' \
+            'LIB_PORT|9000'; do
+  gone="${pair%%|*}"
+  val="${pair#*|}"
   docker run -d --name "gone-${NET}" --network "${NET}" \
     -v "${HERE}/publish/cslib:/plugin:ro" \
-    -e LIB_DIR=/plugin -e LIB_ASSEMBLY=CsLib.dll \
+    -e LIB_ASSEMBLY=CsLib.dll \
     -e LIB_REGISTRAR=CsLib.StoreStartup.Configure \
-    -e "${gone}={\"CsLib.IStamp\":\"CsLib.FakeStamp\"}" \
+    -e "${gone}=${val}" \
     "$IMAGE" >/dev/null 2>&1
   if code="$(wait_stopped "gone-${NET}")" && [ "$code" -ne 0 ] \
      && docker logs "gone-${NET}" 2>&1 | grep -q "${gone}"; then
@@ -531,17 +543,24 @@ done
 # passes it as inert filler -- refusing it would reject configurations that ask
 # for nothing at all. This is the same over-strict guard the codebase already
 # got wrong once and documented.
+# Each removed variable has ONE value that asks for exactly what it already
+# gets, and that value must stay inert: "{}" was LIB_OPTIONS's and
+# LIB_SERVICES's own default, and every harness in existence passes
+# LIB_DIR=/plugin and LIB_PORT=8080 because those WERE the defaults. Refusing
+# them would reject configurations that change nothing -- the same over-strict
+# guard this codebase already got wrong once and documented.
 docker run -d --name "inert-${NET}" --network "${NET}" --network-alias inert \
   -v "${HERE}/publish/cslib:/plugin:ro" \
-  -e LIB_DIR=/plugin -e LIB_ASSEMBLY=CsLib.dll \
+  -e LIB_ASSEMBLY=CsLib.dll \
   -e LIB_REGISTRAR=CsLib.StoreStartup.Configure \
   -e LIB_OPTIONS='{}' -e LIB_SERVICES='{}' -e LIB_TYPE='' \
+  -e LIB_DIR=/plugin -e LIB_PORT=8080 \
   "$IMAGE" >/dev/null 2>&1
 if wait_healthy inert; then
-  ok "an inert '{}' carried forward from an old harness still starts"
+  ok "each removed variable's own former default is still inert"
 else
   docker logs "inert-${NET}" 2>&1 | tail -4
-  bad "an inert '{}' carried forward from an old harness still starts"
+  bad "each removed variable's own former default is still inert"
 fi
 docker rm -f "inert-${NET}" >/dev/null 2>&1 || true
 
@@ -589,7 +608,7 @@ echo "$MISSING_OUT" | grep -q "IStamp" \
 echo "== the startup is the only way to say what to serve =="
 docker run -d --name "croot-${NET}" --network "${NET}" --network-alias croot \
   -v "${HERE}/publish/cslib:/plugin:ro" \
-  -e LIB_DIR=/plugin -e LIB_ASSEMBLY=CsLib.dll \
+  -e LIB_ASSEMBLY=CsLib.dll \
   -e LIB_REGISTRAR=CsLib.GraphStartup.Configure \
   -e DOTNET_EnableDiagnostics=0 \
   "${IMAGE}" >/dev/null
@@ -604,7 +623,7 @@ docker run --rm --network "${NET}" curlimages/curl:8.10.1 -s -m 10 \
 echo "== a missing LIB_REGISTRAR is fatal =="
 docker run -d --name "noconfig-${NET}" --network "${NET}" \
   -v "${HERE}/publish/cslib:/plugin:ro" \
-  -e LIB_DIR=/plugin -e LIB_ASSEMBLY=CsLib.dll \
+  -e LIB_ASSEMBLY=CsLib.dll \
   -e DOTNET_EnableDiagnostics=0 \
   "${IMAGE}" >/dev/null
 if wait_stopped "noconfig-${NET}" \
@@ -1057,7 +1076,7 @@ cp -r "${HERE}/publish/nativelib" "$STRIP"
 rm -rf "$STRIP/runtimes"
 docker run -d --rm --name "natstrip-${NET}" --network "${NET}" --network-alias natstrip \
   -v "$STRIP:/plugin:ro" \
-  -e LIB_DIR=/plugin -e LIB_ASSEMBLY=NativeLib.dll \
+  -e LIB_ASSEMBLY=NativeLib.dll \
   -e LIB_REGISTRAR=NativeLib.NativeStartup.Configure \
   -e DOTNET_EnableDiagnostics=0 "$IMAGE" >/dev/null 2>&1
 if wait_healthy natstrip; then
@@ -1103,7 +1122,7 @@ rm -rf "$(dirname "$STRIP")"
 docker run -d --rm --name "natbypass-${NET}" --network "${NET}" --network-alias natbypass \
   --entrypoint dotnet \
   -v "${HERE}/publish/nativelib:/plugin:ro" \
-  -e LIB_DIR=/plugin -e LIB_ASSEMBLY=NativeLib.dll \
+  -e LIB_ASSEMBLY=NativeLib.dll \
   -e LIB_REGISTRAR=NativeLib.NativeStartup.Configure \
   -e DOTNET_EnableDiagnostics=0 "$IMAGE" \
   /app/RemoteFacadeHost.dll >/dev/null 2>&1
