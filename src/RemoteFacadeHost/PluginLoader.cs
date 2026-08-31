@@ -1,17 +1,18 @@
 using System.Reflection;
+using System.Runtime.Loader;
+using System.Text.Json;
 
 namespace RemoteFacadeHost;
 
 public static class PluginLoader
 {
     /// <summary>
-    /// Loads the plugin assembly into the DEFAULT AssemblyLoadContext and returns
-    /// the requested type.
+    /// Loads the plugin assembly into the DEFAULT AssemblyLoadContext.
     ///
     /// The default context is load-bearing, not a shortcut. A separate
     /// AssemblyLoadContext gives the plugin its own copies of shared assemblies,
     /// so this host's typeof(IOptions&lt;&gt;) becomes a DIFFERENT type identity
-    /// from the plugin's — every dependency shape then has to be matched by
+    /// from the plugin's -- every dependency shape then has to be matched by
     /// string and resolved out of the plugin's assemblies, and the failures are
     /// cryptic nulls. Sharing the context unifies identities. The cost is that
     /// host and plugin must agree on shared package versions.
@@ -19,42 +20,96 @@ public static class PluginLoader
     private static bool _resolverAttached;
 
     /// <summary>
-    /// Loads the plugin assembly. Nothing names a single type: the registrar
-    /// and the per-call service lookups are both resolved out of it by name.
+    /// The plugin's deps.json, which every other resolution decision reads.
+    ///
+    /// Named after LIB_ASSEMBLY rather than found by globbing: a publish
+    /// directory can contain several deps.json files when a plugin carries the
+    /// publish output of its own dependencies, and only the one belonging to
+    /// the named assembly describes the plugin.
+    ///
+    /// Absence is fatal, and deliberately so. AssemblyDependencyResolver
+    /// without a deps.json resolves against the plugin ROOT, which for a
+    /// package shipping a reference stub there (Microsoft.Data.SqlClient is the
+    /// standing example) silently loads the stub. Measured: the first call then
+    /// returns "Microsoft.Data.SqlClient is not supported on this platform" --
+    /// long after a healthy startup, and reading as a database fault rather
+    /// than a packaging one. Refusing to start says the true thing at the only
+    /// moment it is cheap to act on.
     /// </summary>
-    public static Assembly LoadAssembly(string dir, string assemblyFile)
+    internal static string RequireDependencyFile(string dir, string assemblyFile)
     {
-        // Guard against a second Load() re-subscribing: AssemblyResolve is
-        // process-wide with no unsubscription here, so handlers would
-        // otherwise accumulate and resolution order would become
-        // registration order — a dependency could then silently resolve
-        // from the wrong plugin directory. Dormant while Load runs once per
-        // container, but cheap insurance against a later caller (e.g. an
-        // instance-reset path) invoking Load again.
-        if (!_resolverAttached)
+        var deps = Path.Combine(dir, Path.GetFileNameWithoutExtension(assemblyFile) + ".deps.json");
+
+        if (!File.Exists(deps))
         {
-            _resolverAttached = true;
-            AppDomain.CurrentDomain.AssemblyResolve += (_, e) =>
-            {
-                var candidate = Path.Combine(dir, new AssemblyName(e.Name).Name + ".dll");
-                return File.Exists(candidate) ? Assembly.LoadFrom(candidate) : null;
-            };
+            throw new InvalidOperationException(
+                $"{Path.GetFileName(deps)} was not found in {dir}. The host resolves the " +
+                "plugin's dependencies -- its RID-specific assemblies and its native assets " +
+                "-- from that file, and without it a package that ships a reference stub at " +
+                "its root would load the stub and fail later with a message about the wrong " +
+                "thing. Publish the plugin with 'dotnet publish', which emits it, and mount " +
+                "the publish output rather than a project or bin directory.");
         }
 
-        // BEFORE the plugin, and this ordering is the whole fix. Assembly
-        // .LoadFrom probes the loaded assembly's own directory for its
-        // dependencies, so the root copy resolves successfully and
-        // AssemblyResolve never fires -- there is no failure to hook. The only
-        // way to win is to have the right assembly already loaded.
-        var preloaded = PreloadRidAssets(dir);
-
-        if (preloaded.Count > 0)
+        // Present is not the same as usable, and the difference is invisible
+        // without this. A deps.json of "{}" parses, satisfies File.Exists, and
+        // describes nothing -- so AssemblyDependencyResolver resolves nothing
+        // and every package falls back to the plugin root, which is precisely
+        // the state this whole requirement exists to prevent. Measured against
+        // a container carrying one: the host started, reported healthy, and
+        // the first call returned "Microsoft.Data.SqlClient is not supported
+        // on this platform."
+        //
+        // The check is deliberately shallow -- valid JSON, with a non-empty
+        // "targets" -- because that is the part this host actually depends on
+        // and the part a truncated or hand-written file gets wrong. Validating
+        // further would start rejecting documents the runtime itself accepts.
+        JsonElement targets;
+        try
         {
-            Console.Error.WriteLine(
-                $"[plugin] preloaded {preloaded.Count} RID-specific assemblies from " +
-                Path.GetDirectoryName(preloaded[0]));
+            using var doc = JsonDocument.Parse(File.ReadAllText(deps));
+            doc.RootElement.TryGetProperty("targets", out targets);
+            targets = targets.ValueKind == JsonValueKind.Object ? targets.Clone() : default;
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException(
+                $"{Path.GetFileName(deps)} in {dir} could not be read as JSON " +
+                $"({ex.GetType().Name}: {ex.Message}). It is the plugin's dependency file; " +
+                "a truncated or partially-copied one will do this. Re-publish the plugin " +
+                "and mount the complete output.");
         }
 
+        if (targets.ValueKind != JsonValueKind.Object || !targets.EnumerateObject().Any())
+        {
+            throw new InvalidOperationException(
+                $"{Path.GetFileName(deps)} in {dir} describes no dependencies: it has no " +
+                "non-empty \"targets\" section. The host resolves the plugin's RID-specific " +
+                "assemblies and native assets from that section, and an empty one resolves " +
+                "nothing -- every package would fall back to the copy in the plugin root, " +
+                "which for a package shipping a reference stub there means loading the stub. " +
+                "Re-publish the plugin with 'dotnet publish'.");
+        }
+
+        return deps;
+    }
+
+    /// <summary>
+    /// Loads the plugin assembly, resolving its dependencies through
+    /// <paramref name="deps"/>.
+    ///
+    /// LoadFromAssemblyPath, NOT Assembly.LoadFrom, and the difference is the
+    /// whole reason this works. LoadFrom installs probing that searches the
+    /// loaded assembly's own directory, so a package's ROOT copy resolves
+    /// successfully and the Resolving hook below never fires -- there is no
+    /// failure to hook, and the reference stub wins. Measured both ways: with
+    /// LoadFrom the host had to pre-load the RID-specific assemblies before
+    /// touching the plugin to get in front of that probing; with
+    /// LoadFromAssemblyPath the hook fires and deps.json decides, so no
+    /// pre-loading is needed at all.
+    /// </summary>
+    public static Assembly LoadAssembly(string dir, string assemblyFile, AssemblyDependencyResolver deps)
+    {
         var path = Path.Combine(dir, assemblyFile);
 
         if (!File.Exists(path))
@@ -62,120 +117,22 @@ public static class PluginLoader
             throw new InvalidOperationException($"assembly not found: {path}");
         }
 
-        return Assembly = Assembly.LoadFrom(path);
-    }
-
-    /// <summary>
-    /// Loads the plugin's RID-specific MANAGED assemblies BEFORE the plugin
-    /// itself, so its references bind to them rather than to the copies in the
-    /// plugin root.
-    ///
-    /// The root copy is not always the real implementation. Packages that ship
-    /// per-platform builds put a reference assembly at the root and the working
-    /// one under runtimes/&lt;rid&gt;/lib/&lt;tfm&gt;. Microsoft.Data.SqlClient is
-    /// the common case: its root assembly is a stub whose members throw
-    /// "Microsoft.Data.SqlClient is not supported on this platform", and the
-    /// implementation is 3x the size under runtimes/unix/lib.
-    ///
-    /// Normally the runtime picks between them from the app's deps.json. A
-    /// plugin loaded by Assembly.LoadFrom gets none of that -- the HOST's
-    /// deps.json governs, and it has never heard of the plugin's packages -- so
-    /// without this the stub loads and every call fails at the first use.
-    ///
-    /// This is the managed twin of what NativeResolver does for native assets.
-    /// Same cause, same shape of fix.
-    /// </summary>
-    /// <summary>
-    /// The RID fallback chain for MANAGED assets, most specific first.
-    ///
-    /// Deliberately not NativeResolver's chain. A native binary must match the
-    /// platform exactly, so that one tries only the running RID and its
-    /// glibc/musl twin. Managed assets are portable, and packages ship them
-    /// under portable RIDs: Microsoft.Data.SqlClient uses runtimes/unix, which
-    /// matches no exact RID at all. Without the portable rungs the preload
-    /// finds nothing and the stub still wins, which is exactly what the first
-    /// version of this did.
-    /// </summary>
-    internal static IEnumerable<string> ManagedRidCandidates()
-    {
-        var rid = System.Runtime.InteropServices.RuntimeInformation.RuntimeIdentifier;
-        yield return rid;
-
-        if (rid.Contains("-musl-"))
+        // Guard against a second call re-subscribing: Resolving is process-wide
+        // with no unsubscription here, so handlers would otherwise accumulate
+        // and resolution order would become subscription order. Dormant while
+        // this runs once per container, but cheap insurance against a later
+        // reload path.
+        if (!_resolverAttached)
         {
-            yield return rid.Replace("-musl-", "-");
+            _resolverAttached = true;
+
+            AssemblyLoadContext.Default.Resolving += (context, name) =>
+                deps.ResolveAssemblyToPath(name) is { } resolved
+                    ? context.LoadFromAssemblyPath(resolved)
+                    : null;
         }
 
-        var os = rid.Split('-')[0];
-
-        if (rid.Contains("-musl"))
-        {
-            yield return $"{os}-musl";
-        }
-
-        yield return os;
-
-        // Everything that is not Windows answers to "unix" in the RID graph.
-        if (!os.StartsWith("win", StringComparison.OrdinalIgnoreCase))
-        {
-            yield return "unix";
-        }
-    }
-
-    internal static IReadOnlyList<string> PreloadRidAssets(string dir)
-    {
-        var loaded = new List<string>();
-
-        var framework = RidAssetDirectory(dir);
-
-        if (framework is not null)
-        {
-            foreach (var dll in Directory.GetFiles(framework, "*.dll"))
-            {
-                try
-                {
-                    Assembly.LoadFrom(dll);
-                    loaded.Add(dll);
-                }
-                catch (Exception ex)
-                {
-                    // A file that will not load is not fatal: the plugin may
-                    // never touch it, and failing here would turn an unused
-                    // asset into a container that refuses to start.
-                    Console.Error.WriteLine($"[plugin] could not preload {dll}: {ex.Message}");
-                }
-            }
-        }
-
-        return loaded;
-    }
-
-    /// <summary>
-    /// The one framework folder to preload from, or null when the plugin ships
-    /// no RID-specific managed assets.
-    ///
-    /// The FIRST matching RID wins and the search stops. Continuing would load
-    /// the same assemblies again from a less specific RID, and whichever landed
-    /// first would silently decide the behaviour.
-    /// </summary>
-    internal static string? RidAssetDirectory(string dir)
-    {
-        foreach (var rid in ManagedRidCandidates())
-        {
-            var libs = Path.Combine(dir, "runtimes", rid, "lib");
-            if (!Directory.Exists(libs)) continue;
-
-            // Highest framework folder first: a package may ship net8.0 and
-            // net9.0 side by side, and the newest is the one the SDK would have
-            // chosen.
-            var framework = Directory.GetDirectories(libs)
-                .OrderByDescending(Path.GetFileName, StringComparer.OrdinalIgnoreCase)
-                .FirstOrDefault();
-
-            if (framework is not null) return framework;
-        }
-
-        return null;
+        return Assembly = AssemblyLoadContext.Default.LoadFromAssemblyPath(path);
     }
 
     /// <summary>The loaded assembly, exposed so /types can report on it.</summary>

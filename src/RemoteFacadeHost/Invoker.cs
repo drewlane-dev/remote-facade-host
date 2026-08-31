@@ -271,7 +271,7 @@ public static class Invoker
             // exception, observed at `await task`, arrives already unwrapped
             // — so only unwrap when there's actually a wrapper to remove.
             var real = ex is TargetInvocationException { InnerException: { } inner } ? inner : ex;
-            return new { ok = false, error = real.Message + NativeResolver.HintFor(real) };
+            return new { ok = false, error = real.Message + NativeDiagnostics.HintFor(real) };
         }
     }
 }

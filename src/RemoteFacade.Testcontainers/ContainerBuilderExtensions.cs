@@ -51,7 +51,7 @@ public static class ContainerBuilderExtensions
 
     /// <summary>
     /// Mounts a published plugin directory and points the host at its startup:
-    /// the bind mount, LIB_DIR, LIB_ASSEMBLY, LIB_REGISTRAR, a randomised port
+    /// the bind mount, LIB_ASSEMBLY, LIB_REGISTRAR, a randomised port
     /// binding, and a wait strategy.
     /// </summary>
     /// <param name="startup">
@@ -91,7 +91,6 @@ public static class ContainerBuilderExtensions
         builder = (transport == PluginTransport.Copy
                 ? builder.WithResourceMapping(new DirectoryInfo(full), "/plugin")
                 : builder.WithBindMount(full, "/plugin", AccessMode.ReadOnly))
-            .WithEnvironment("LIB_DIR", "/plugin")
             .WithEnvironment(new Dictionary<string, string>(
                 RemoteHostEnvironment.For(startup, registrarMethod)))
             .WithPortBinding(Port, assignRandomHostPort: true);

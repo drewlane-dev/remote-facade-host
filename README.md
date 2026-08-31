@@ -22,11 +22,30 @@ No code generation. Your test already references the library for its
 interface, so a `DispatchProxy` implements it and the compiler checks the
 contract.
 
-> **v3 is breaking.** Single-class hosting (`LIB_TYPE`, `LIB_OPTIONS`) and the
-> client's `RemoteFacade.For<T>(url)` are gone — a startup is the only way to
-> host, `RemoteHost` the only way to call. Callbacks (`LIB_CALLBACKS`,
-> `CallbackHost`) are out for now and preserved on the `callbacks` branch; use
-> `LIB_SERVICES` to substitute a dependency meanwhile.
+> **v4 is breaking.** Four things changed, and each fails loudly at startup
+> rather than drifting:
+>
+> - **`LIB_SERVICES` is gone.** Substitute a dependency with a startup that
+>   calls your real one and then `services.Replace(...)` — see [Substituting a
+>   dependency](#substituting-a-dependency). Unlike the old map, that lets you
+>   choose the lifetime.
+> - **The plugin's `.deps.json` is required.** Mount `dotnet publish` output,
+>   not a project or `bin` directory. Without it a package shipping a reference
+>   stub at its root would load the stub and fail much later, naming the wrong
+>   thing.
+> - **`LIB_DIR` and `LIB_PORT` are gone.** The mount is always `/plugin` and the
+>   host always listens on `8080`; map the port with Docker's own `-p`.
+> - **Don't override the entrypoint.** It is what puts the plugin's native
+>   assets on the loader's search path, and it is now the only thing that does.
+>
+> Setting any removed variable is a fatal startup error naming the replacement,
+> except when set to its own former default — so a harness passing
+> `LIB_DIR=/plugin` or `LIB_SERVICES={}` keeps working untouched.
+>
+> **v3 was breaking too.** Single-class hosting (`LIB_TYPE`, `LIB_OPTIONS`) and
+> the client's `RemoteFacade.For<T>(url)` went then — a startup is the only way
+> to host, `RemoteHost` the only way to call. Callbacks (`LIB_CALLBACKS`,
+> `CallbackHost`) remain out and preserved on the `callbacks` branch.
 
 ## Quick start
 
@@ -53,7 +72,7 @@ dotnet publish MyApp.csproj -o ./publish
 docker run -v "$(pwd)/publish:/plugin:ro" \
   -e LIB_ASSEMBLY=MyApp.dll \
   -e LIB_REGISTRAR=MyApp.TestStartup.Configure \
-  -p 8080:8080 ghcr.io/drewlane-dev/remote-facade-host:3.3.2
+  -p 8080:8080 ghcr.io/drewlane-dev/remote-facade-host:4.0.0
 ```
 
 Then drive it. With [Testcontainers](https://dotnet.testcontainers.org/), the
@@ -81,7 +100,7 @@ flowchart LR
     end
 
     out -- "bind mount" --> mnt
-    env["LIB_ASSEMBLY / LIB_REGISTRAR<br/>LIB_SERVICES"] -- "env vars" --> load
+    env["LIB_ASSEMBLY / LIB_REGISTRAR"] -- "env vars" --> load
 
     inst -.-> shared[("shared state<br/>SMB share, SQL, ...")]
 ```
@@ -96,7 +115,7 @@ sequenceDiagram
     participant host as Container :8080
     participant real as Your real instance
 
-    Note over proxy: RemoteFacade.For#lt;IStore#gt;(url)<br/>a DispatchProxy, no codegen
+    Note over proxy: host.GetAsync#lt;IStore#gt;()<br/>a DispatchProxy, no codegen
 
     test->>proxy: store.WriteAsync("a.txt", "hi")
     proxy->>host: POST /invoke<br/>{ method, args, service? }
@@ -113,11 +132,16 @@ sequenceDiagram
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `LIB_ASSEMBLY` | **required** | Assembly file name inside `LIB_DIR`, e.g. `MyApp.dll`. |
+| `LIB_ASSEMBLY` | **required** | Assembly file name inside `/plugin`, e.g. `MyApp.dll`. |
 | `LIB_REGISTRAR` | **required** | `Namespace.Type.Method` — a static method taking an `IServiceCollection`. Unset is a fatal startup error. |
-| `LIB_DIR` | `/plugin` | Directory containing the publish output. |
-| `LIB_SERVICES` | `{}` | Interface-to-implementation overrides, applied *after* the startup. See below. |
-| `LIB_PORT` | `8080` | Port to listen on. |
+
+Mount your publish output at **`/plugin`**, and the host listens on **8080**.
+Neither is configurable: `LIB_DIR` and `LIB_PORT` were removed in v4 because
+nothing set them and changing the port only desynchronised the container from
+`EXPOSE`, from the Testcontainers helper and from the `/health` wait. Map the
+port with Docker's own `-p`. The mounted directory must contain the plugin's
+`.deps.json` — the host resolves dependencies and native assets from it and
+refuses to start without one.
 
 ### Mounting an SMB share
 
@@ -172,7 +196,7 @@ Testcontainers.
 
 ```csharp
 await using var container = new ContainerBuilder()
-    .WithImage("ghcr.io/drewlane-dev/remote-facade-host:3.3.2")
+    .WithImage("ghcr.io/drewlane-dev/remote-facade-host:4.0.0")
     .WithRemoteFacade(typeof(TestStartup), pluginDir)
     .WithOptions(new StoreOptions { RootPath = "/mnt/share" })
     .WithSmbMount(new SmbMount { Server = "samba", Share = "data" })
@@ -184,7 +208,7 @@ await using var host = container.RemoteHost();
 
 | | |
 |---|---|
-| `WithRemoteFacade` | Bind mount, `LIB_DIR`, `LIB_ASSEMBLY`, `LIB_REGISTRAR`, a random port binding, and a wait on `/health` — not on the port, which is bound before the graph is built. Throws if the plugin directory does not exist, since a missing one bind-mounts as an empty one. Pass `transport: PluginTransport.Copy` when the **test itself** runs in a container: a bind mount there names a path on the Docker host, and the container silently gets an empty directory. |
+| `WithRemoteFacade` | Bind mount, `LIB_ASSEMBLY`, `LIB_REGISTRAR`, a random port binding, and a wait on `/health` — not on the port, which is bound before the graph is built. Throws if the plugin directory does not exist, since a missing one bind-mounts as an empty one. Pass `transport: PluginTransport.Copy` when the **test itself** runs in a container: a bind mount there names a path on the Docker host, and the container silently gets an empty directory. |
 | `WithOptions` | The same typed push-down as above, straight onto the builder. |
 | `WithSmbMount` | Credentials plus the privileges a cifs mount needs: `SYS_ADMIN`, `DAC_READ_SEARCH`, and `apparmor=unconfined`. Without them the mount fails with a message that mentions none of them. |
 | `RemoteHost()` | A client on the **mapped** port, so there is no hostname/port string to get subtly wrong. |
@@ -250,15 +274,34 @@ Bare values that are not an options class keep using `WithEnvironment`.
 
 ## Substituting a dependency
 
-`LIB_SERVICES` maps an interface to an implementation, both resolved from the
-plugin assembly, applied *after* your startup runs:
+Write a startup that calls your real one and then replaces the one thing you
+want faked:
 
-```
--e LIB_SERVICES='{"MyApp.IClock":"MyApp.Testing.FixedClock"}'
+```csharp
+public static class TestStartup
+{
+    public static void Configure(IServiceCollection services)
+    {
+        Production.Configure(services);                 // real wiring
+        services.Replace(ServiceDescriptor.Singleton<IClock, FixedClock>());
+    }
+}
 ```
 
-Real wiring, one thing faked — without the plugin knowing it is under test.
-The fake must be a type in the plugin assembly.
+Point `LIB_REGISTRAR` at it. Real wiring, one thing faked — without the plugin
+knowing it is under test. The fake must be a type in the plugin assembly, since
+a mock built in your test process cannot be injected into a remote instance.
+
+Because this is ordinary C#, you choose the lifetime, and you can substitute a
+factory, a keyed service, or nothing at all depending on an environment
+variable the startup reads itself.
+
+> **Removed in v4.** `LIB_SERVICES` took a JSON interface-to-implementation map
+> and applied it after your startup. It always registered `Singleton`, which
+> silently changed the semantics of a `Transient` dependency. Setting it is now
+> a fatal startup error naming this replacement, rather than being ignored — a
+> suite that believed it was running against a fake would otherwise run against
+> the real dependency and still pass its health check.
 
 ## Things worth knowing
 
@@ -270,11 +313,22 @@ The error says so and names the service. Register it `Singleton` or
 a lock and a later call release it. `DELETE /instance` resets between tests;
 proxies you already hold keep working, because services resolve per call.
 
-**Native dependencies just work.** A plugin carrying `runtimes/<rid>/native`
-(LibGit2Sharp, SkiaSharp, SQLitePCLRaw) loads with no configuration — no
-`LD_LIBRARY_PATH`, no knowing the image's RID. The image is Alpine, so the RID
-is `linux-musl-*`; a package shipping only `linux-x64` will not load, and the
-error says so, naming the library and every directory searched.
+**Native dependencies just work — but don't override the entrypoint.** A
+plugin carrying `runtimes/<rid>/native` (LibGit2Sharp, SQLitePCLRaw) loads with
+no configuration on your side: the image's entrypoint puts those directories on
+`LD_LIBRARY_PATH` before the host starts, so you never set it and never need to
+know the image's RID. That script is the *only* mechanism — running with
+`--entrypoint dotnet`, or any orchestrator that replaces the entrypoint, leaves
+native assets unfindable. The error says so.
+
+The image is Alpine, so the RID is `linux-musl-*`; a package shipping only
+`linux-x64` will not load, and the error names the library, the RID and the
+path that was searched.
+
+Native assets that need *system* libraries are a separate matter, and this is
+not a general-purpose base image. SkiaSharp, for instance, does **not** work
+here: `libSkiaSharp.so` needs `libfontconfig.so.1`, which the image does not
+install, and no search path can supply it.
 
 **Globalization is enabled.** Alpine .NET images run in invariant mode by
 default, where anything culture-aware throws *"Globalization Invariant Mode is
@@ -284,11 +338,21 @@ than an image one. The image ships ICU and turns invariant mode off.
 
 **RID-specific assemblies resolve too.** A package that ships a reference stub
 at its root and the real build under `runtimes/<rid>/lib` — `Microsoft.Data.SqlClient`
-is the common one — works without configuration. Those are normally chosen from
-the app's `deps.json`, which a plugin loaded by `Assembly.LoadFrom` never gets,
-so the host preloads them from the plugin's own `runtimes` folder before
-loading it. Without that, SqlClient's root stub loads and every call fails with
-*"Microsoft.Data.SqlClient is not supported on this platform."*
+is the common one — works without configuration. Both these and native assets
+are resolved from **the plugin's own `deps.json`**, which is why that file is
+required: without a usable one the host would fall back to the copy in the
+plugin root and every SqlClient call would fail with *"Microsoft.Data.SqlClient
+is not supported on this platform."* — long after a healthy startup, reading as
+a database fault rather than a packaging one. A missing or empty `deps.json` is
+therefore a fatal startup error naming the file. `dotnet publish` always emits
+one; mount its output rather than a project or `bin` directory.
+
+**A plugin cannot add routes.** The host serves its API from an MVC controller,
+and MVC finds controllers by convention — any public class whose name ends in
+`Controller`, no base class or attribute required. Discovery is scoped to the
+host's own assembly, so a controller-shaped type in *your* library is never
+routed, and cannot shadow `/invoke` or `/health`. `test/run.sh` proves it
+against a fixture carrying exactly such a type.
 
 **Host and plugin share a load context.** So `typeof(IOptions<>)` means the
 same thing on both sides and constructor matching works. The cost: you must
@@ -314,7 +378,7 @@ dotnet test test/integration/RemoteFacade.IntegrationTests/RemoteFacade.Integrat
 
 | Suite | Covers | Why it can't be one of the others |
 |---|---|---|
-| unit | logic — `InstanceHolder`, `Invoker`, `NativeResolver`, the client | Reset-during-a-call and racing resets can't be timed reliably over HTTP; a test that hopes the interleaving lands proves nothing when it passes. |
+| unit | logic — `InstanceHolder`, `Invoker`, `NativeResolver`, the client — plus the endpoints themselves, both as plain method calls and over a real in-process pipeline | Reset-during-a-call and racing resets can't be timed reliably over HTTP; a test that hopes the interleaving lands proves nothing when it passes. The endpoint cases need no plugin and no Docker, so every `/invoke` rejection branch is reachable in milliseconds. |
 | `test/run.sh` | the wire, with `curl` | Only a byte comparison against the previous release catches a dropped field. |
 | integration | the composition path through `RemoteHost` | `run.sh` speaks the protocol with `curl`, so it never exercises the client package consumers depend on. |
 

@@ -2,19 +2,34 @@
 # Puts the plugin's native asset directories on the dynamic loader's search
 # path, then starts the host.
 #
-# NativeResolver (src/RemoteFacadeHost/NativeResolver.cs) already handles the
-# managed side: a P/Invoke from a plugin assembly that default probing cannot
-# satisfy. This script exists for the case that hook CANNOT see -- one native
-# library dlopen()ing a sibling native library directly, never passing through
-# the CLR. SkiaSharp does this; so does anything shipping a split .so set. No
-# managed hook fires for those, so the only fix is a real LD_LIBRARY_PATH.
+# This is the ONLY thing that makes a plugin's native assets findable. A
+# managed ResolvingUnmanagedDll hook used to sit alongside it and was removed:
+# that hook fires only after default probing FAILS, default probing is dlopen,
+# and dlopen reads LD_LIBRARY_PATH -- so whenever this script had run, the hook
+# could not fire. Measured, not assumed.
+#
+# The reverse is not true, which is why this side is the one that survived. A
+# native library with a sibling dependency in the same directory cannot be
+# loaded by absolute path -- all a managed hook can do -- unless it sets an
+# $ORIGIN RUNPATH, because the dynamic loader resolves DT_NEEDED against
+# RUNPATH, LD_LIBRARY_PATH and the system paths, and never against the
+# directory of the object being loaded. Measured on a purpose-built pair:
+# without RUNPATH, dlopen("/abs/libparent.so") fails with "Error loading shared
+# library libchild.so"; with the directory here, it succeeds.
+#
+# (An earlier version of this comment cited SkiaSharp as the example. That is
+# wrong and was checked: libSkiaSharp.so needs libfontconfig.so.1, a SYSTEM
+# library this path cannot supply and which the image does not install, plus
+# libc -- no siblings at all. libgit2 has none either. The mechanism is real;
+# neither package this repo tests exercises it.)
 #
 # And it has to be set HERE rather than in C#, because the dynamic loader reads
 # LD_LIBRARY_PATH once when the process starts. Setting it from inside the
 # running host would affect child processes and nothing else.
 set -eu
 
-DIR="${LIB_DIR:-/plugin}"
+# Fixed: LIB_DIR was removed in v4, so this is the only plugin path.
+DIR="/plugin"
 
 # The image is Alpine, so musl -- but derive it rather than hardcode it, so
 # this keeps working if the base image is ever changed to a glibc one.

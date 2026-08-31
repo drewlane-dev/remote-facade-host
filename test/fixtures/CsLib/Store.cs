@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -36,8 +37,9 @@ public sealed class RealStamp : IStamp
 }
 
 // A fake compiled INTO the plugin. Mocks from the test process cannot be
-// injected into a remote instance; a fake named in LIB_SERVICES is how you
-// substitute behaviour.
+// injected into a remote instance, so a fake has to be a type the plugin
+// itself carries; a startup that registers it is how you substitute behaviour
+// (see FakeStampStartup).
 public sealed class FakeStamp : IStamp
 {
     public string Value() => "fake";
@@ -553,20 +555,6 @@ public static class ThrowingDisposableRootStartup
     }
 }
 
-/// <summary>Registers DisposableRoot as a ready-made INSTANCE -- the
-/// ordinary `services.AddSingleton&lt;T&gt;(existingInstance)` LIB_REGISTRAR
-/// pattern -- rather than a type or factory mapping. The provider RETURNS
-/// this on GetService, but did not CREATE it, so .NET's own container never
-/// tracks it for disposal, unlike DisposableRootStartup above. This is the
-/// shape that exposed "the provider returned it" != "the provider will
-/// dispose it": HostedGraph must dispose this one itself.</summary>
-public static class DisposableRootInstanceStartup
-{
-    public static void Configure(IServiceCollection services)
-        => services.AddSingleton(new DisposableRoot(
-            Options.Create(new DisposableOptions { SentinelPath = "/tmp/disposed-instance" })));
-}
-
 /// <summary>An IDisposable root whose Dispose() APPENDS a line and then
 /// THROWS.
 ///
@@ -595,44 +583,6 @@ public sealed class ThrowingDisposableRoot(IOptions<DisposableOptions> options) 
         File.AppendAllText(_sentinelPath, "disposed\n");
         throw new InvalidOperationException("plugin Dispose() deliberately threw");
     }
-}
-
-/// <summary>A concrete type with zero PUBLIC constructors for a reason other
-/// than being an interface -- the case the guard removed from Activation.cs
-/// (LIB_TYPE with no public constructor is no longer a hard error there)
-/// must still fail, just later, by naming the type.</summary>
-public sealed class PrivateCtorRoot
-{
-    private PrivateCtorRoot() { }
-    public string Ping() => "unreachable";
-}
-
-/// <summary>A root with more than one public constructor, one marked
-/// [ActivatorUtilitiesConstructor]. Registered via the container rather than
-/// left for ActivatorUtilities, so which constructor actually runs pins the
-/// container's OWN selection -- it is not obliged to honour the attribute,
-/// which is an ActivatorUtilities-only convention.</summary>
-public sealed class MultiCtorRoot
-{
-    public string Which { get; }
-
-    [ActivatorUtilitiesConstructor]
-    public MultiCtorRoot(IOptions<StoreOptions> options)
-    {
-        Which = "attributed-one";
-    }
-
-    public MultiCtorRoot(IOptions<StoreOptions> options, ILogger<MultiCtorRoot> logger)
-    {
-        Which = "two";
-    }
-
-    public string WhichCtor() => Which;
-}
-
-public static class MultiCtorStartup
-{
-    public static void Configure(IServiceCollection services) => services.AddSingleton<MultiCtorRoot>();
 }
 
 // --- review round 3 fixtures ---
@@ -785,15 +735,6 @@ public sealed class AsyncOnlyRoot : IAsyncDisposable
     }
 }
 
-/// <summary>Pairs a throwing-Dispose root with a provider-owned IDisposable
-/// singleton -- the combination that shows a throwing root taking every
-/// singleton in the graph down with it. GraphStartup could not show it:
-/// nothing it registers is IDisposable.</summary>
-public static class ThrowingRootOwnedStartup
-{
-    public static void Configure(IServiceCollection services) => services.AddSingleton<OwnedResource>();
-}
-
 /// <summary>Registers both disposal shapes. The TEST resolves OwnedResource
 /// FIRST and AsyncOnlyResource SECOND on purpose: the container disposes in
 /// reverse creation order, so the async-only one is reached first and, under
@@ -806,36 +747,6 @@ public static class AsyncOnlyStartup
     {
         services.AddSingleton<OwnedResource>();
         services.AddSingleton<AsyncOnlyResource>();
-    }
-}
-
-/// <summary>Registers IStore -> Store, and Store's own IStamp dependency,
-/// from a REGISTRAR rather than from LIB_SERVICES.
-///
-/// Exists to de-confound the unbindable-LIB_OPTIONS guard. The first version
-/// of that test used CsLib.IRootFacade, whose implementation takes no
-/// IOptions&lt;T&gt; at all -- so it could not distinguish "the host refused
-/// because no implementation was NAMED" (the intended reason) from "the host
-/// refused because nothing ASKED for options" (a bug the guard had, and one
-/// that fired on correct configurations too). CsLib.Store genuinely takes
-/// IOptions&lt;StoreOptions&gt;, so this fixture exercises the guard for the
-/// one reason it is allowed to fire.</summary>
-public static class OptionsFacadeStartup
-{
-    public static void Configure(IServiceCollection services)
-    {
-        services.AddSingleton<IStamp, RealStamp>();
-
-        // Registered BOTH ways, resolving to ONE instance. v2 could name the
-        // concrete class as LIB_TYPE and reach every public method on it,
-        // including those IStore does not declare. Routing by service name
-        // dispatches against the type NAMED, so without a concrete
-        // registration those methods would become unreachable -- and the
-        // second registration must delegate rather than construct, or the two
-        // names would hand out two different objects and the file-locking
-        // cases would stop contending with each other.
-        services.AddSingleton<Store>();
-        services.AddSingleton<IStore>(sp => sp.GetRequiredService<Store>());
     }
 }
 
@@ -857,8 +768,8 @@ public static class StoreStartup
 
         services.Configure<StoreOptions>(o => o.RootPath = root);
 
-        // The default. LIB_SERVICES can still Replace it with FakeStamp or
-        // SecretStamp, which applies after this method runs.
+        // The default. A startup wanting FakeStamp or SecretStamp instead
+        // calls this method and then Replace -- see FakeStampStartup.
         services.AddSingleton<IStamp, RealStamp>();
 
         // Registered BOTH ways, resolving to ONE instance. v2 could name the
@@ -871,6 +782,29 @@ public static class StoreStartup
         // cases would stop contending with each other.
         services.AddSingleton<Store>();
         services.AddSingleton<IStore>(sp => sp.GetRequiredService<Store>());
+    }
+}
+
+/// <summary>
+/// Real wiring, one thing faked -- the whole of what LIB_SERVICES used to do,
+/// in ordinary C#.
+///
+/// This is the shape the host's removal message points operators at. It
+/// composes the REAL composition root (Registration.AddCsLib, an extension
+/// method, which is also why this doubles as the case proving a registrar can
+/// be one) and then replaces exactly one registration.
+///
+/// Note what the JSON map could not have said and this does: the lifetime is
+/// chosen here. The map always registered Singleton, so substituting a
+/// Transient dependency silently changed its semantics as well as its
+/// implementation.
+/// </summary>
+public static class FakeStampStartup
+{
+    public static void Configure(IServiceCollection services)
+    {
+        services.AddCsLib();
+        services.Replace(ServiceDescriptor.Singleton<IStamp, FakeStamp>());
     }
 }
 
@@ -1016,4 +950,24 @@ public static class GlobalizationProbeStartup
 {
     public static void Configure(IServiceCollection services) =>
         services.AddSingleton<IGlobalizationProbe, GlobalizationProbe>();
+}
+
+/// <summary>
+/// A controller-shaped type in a PLUGIN, which must never be served.
+///
+/// The host serves its API from an MVC controller, and MVC discovers
+/// controllers BY CONVENTION: ControllerFeatureProvider.IsController accepts
+/// any public, non-abstract, non-generic class whose name ends in "Controller",
+/// with no base class and no attribute required -- which is why this type can
+/// exist here without CsLib referencing any part of ASP.NET Core.
+///
+/// Discovery is scoped to the host's registered application parts, and a plugin
+/// loaded by Assembly.LoadFrom is not one. That is the property under test: a
+/// third-party assembly this image loads must not be able to add, replace or
+/// shadow a route on the host that loaded it. Nothing enforced this while the
+/// endpoints were minimal-API lambdas, because there was no discovery at all.
+/// </summary>
+public sealed class HijackController
+{
+    public string Index() => "the plugin answered a route it should not have";
 }

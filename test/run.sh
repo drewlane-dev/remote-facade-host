@@ -21,27 +21,17 @@ cleanup() {
 trap cleanup EXIT
 docker network create "${NET}" >/dev/null
 
-start_host() { # start_host <alias> <pluginDir> <assembly> <registrar> [servicesJson] [storeRoot] [sentinelPath]
+start_host() { # start_host <alias> <pluginDir> <assembly> <registrar> [storeRoot] [sentinelPath]
   # DOTNET_EnableDiagnostics=0: belt-and-suspenders alongside giving the
   # plugin its own private RootPath (below) -- without it the runtime drops
   # its own diagnostic pipe/socket files straight into /tmp, which would
   # again pollute any OTHER process's directory count if it ever pointed
   # back at /tmp directly.
-  #
-  # servicesJson is computed on its own line rather
-  # than inline as "${6:-{}}": a bare "{" inside a ${...:-word} default is
-  # not brace-matched against the "}" that closes the expansion, so the
-  # parser closes the expansion at the FIRST "}" and leaves a stray "}"
-  # behind in the shell word -- corrupting the value (to "...}}") even when
-  # the positional argument IS set.
-  servicesJson="${5:-}"
-  [ -z "$servicesJson" ] && servicesJson='{}'
   docker run -d --rm --name "$1-${NET}" --network "${NET}" --network-alias "$1" \
     -v "$2:/plugin:ro" \
-    -e LIB_DIR=/plugin -e LIB_ASSEMBLY="$3" -e LIB_REGISTRAR="$4" \
-    -e LIB_SERVICES="$servicesJson" \
-    -e STORE_ROOT="${6:-/tmp}" \
-    -e SENTINEL_PATH="${7:-}" \
+    -e LIB_ASSEMBLY="$3" -e LIB_REGISTRAR="$4" \
+    -e STORE_ROOT="${5:-/tmp}" \
+    -e SENTINEL_PATH="${6:-}" \
     -e DOTNET_EnableDiagnostics=0 \
     "$IMAGE" >/dev/null 2>&1
 }
@@ -102,7 +92,7 @@ echo "== loads and constructs a C# class =="
 # own diagnostic pipe/socket files, which Store.Count() -- Directory.GetFiles
 # over RootPath -- would otherwise count as its own.
 start_host cs "${HERE}/publish/cslib" CsLib.dll CsLib.StoreStartup.Configure \
-  '{"CsLib.IStamp":"CsLib.RealStamp"}' /tmp/cslib-data
+  /tmp/cslib-data
 if wait_healthy cs; then
   ok "host constructs the configured type"
 else
@@ -113,6 +103,34 @@ fi
 echo "== /types is a usable diagnostic =="
 api cs /types | grep -q "CsLib.Store" \
   && ok "/types lists the assembly's types" || bad "/types lists the assembly's types"
+
+echo "== a plugin cannot add routes to the host that loaded it =="
+# The host serves its API from an MVC controller, and MVC finds controllers by
+# CONVENTION -- any public class whose name ends in "Controller". CsLib carries
+# exactly such a type (CsLib.HijackController) with no ASP.NET Core reference of
+# its own, so this asks the real question: can a loaded plugin get a route
+# served? Discovery is scoped to the host's application parts, and a plugin
+# loaded by Assembly.LoadFrom is not one.
+#
+# Vacuity guard: /types must actually list the type, or a 404 below would prove
+# only that the fixture failed to publish.
+api cs /types | grep -q "CsLib.HijackController" \
+  && ok "the hijack fixture really is in the loaded assembly" \
+  || bad "the hijack fixture really is in the loaded assembly"
+
+hijack_code=$(api cs /hijack -o /dev/null -w '%{http_code}')
+hijack_index=$(api cs /Hijack/Index -o /dev/null -w '%{http_code}')
+if [ "$hijack_code" = "404" ] && [ "$hijack_index" = "404" ]; then
+  ok "a controller-shaped type in a plugin is not routed"
+else
+  bad "a controller-shaped type in a plugin is not routed (/hijack=$hijack_code /Hijack/Index=$hijack_index)"
+fi
+
+# The host's own five routes are the whole surface. A plugin type that shadowed
+# one of them would show up here as a changed body, not as a new route.
+api cs /health | grep -q '"registrar":"CsLib.StoreStartup.Configure"' \
+  && ok "the host's own routes are unaffected by a plugin's controller-shaped type" \
+  || bad "the host's own routes are unaffected by a plugin's controller-shaped type"
 
 echo "== all four return shapes over /invoke =="
 CLIENT_OUT=$(docker run --rm --network "${NET}" -v "${HERE}/..:/w" -w /w \
@@ -325,7 +343,7 @@ api cs /health | grep -q "CsLib.Store" \
   && ok "host still serves after a reset" || bad "host still serves after a reset"
 
 echo "== the same image serves a VB library, unchanged =="
-start_host vb "${HERE}/publish/vblib" VbLib.dll VbLib.VbStartup.Configure '{}' /tmp
+start_host vb "${HERE}/publish/vblib" VbLib.dll VbLib.VbStartup.Configure /tmp
 if wait_healthy vb; then
   ok "host constructs a VB type"
 else
@@ -352,9 +370,8 @@ for n in ia ib; do
   docker run -d --rm --name "$n-${NET}" --network "${NET}" --network-alias "$n" \
     --cap-add SYS_ADMIN --cap-add DAC_READ_SEARCH --security-opt apparmor=unconfined \
     -v "${HERE}/publish/cslib:/plugin:ro" \
-    -e LIB_DIR=/plugin -e LIB_ASSEMBLY=CsLib.dll \
+    -e LIB_ASSEMBLY=CsLib.dll \
     -e LIB_REGISTRAR=CsLib.StoreStartup.Configure -e STORE_ROOT=/mnt/share \
-    -e LIB_SERVICES='{"CsLib.IStamp":"CsLib.RealStamp"}' \
     -e SMB_SERVER=samba -e SMB_SHARE=data \
     "$IMAGE" >/dev/null 2>&1
 done
@@ -406,7 +423,7 @@ echo "== a misconfigured mount is fatal, not silently skipped =="
 # exit code can still be inspected after it exits.
 docker run -d --name "badhost-${NET}" --network "${NET}" \
   -v "${HERE}/publish/cslib:/plugin:ro" \
-  -e LIB_DIR=/plugin -e LIB_ASSEMBLY=CsLib.dll -e LIB_REGISTRAR=CsLib.StoreStartup.Configure \
+  -e LIB_ASSEMBLY=CsLib.dll -e LIB_REGISTRAR=CsLib.StoreStartup.Configure \
   --cap-add SYS_ADMIN --cap-add DAC_READ_SEARCH --security-opt apparmor=unconfined \
   -e SMB_SERVER=no-such-smb-host -e SMB_SHARE=data \
   "$IMAGE" >/dev/null 2>&1
@@ -425,7 +442,7 @@ docker rm -f "badhost-${NET}" >/dev/null 2>&1 || true
 # --cap-add here: this must fail before ever calling `mount`.
 docker run -d --name "badcfg-${NET}" --network "${NET}" \
   -v "${HERE}/publish/cslib:/plugin:ro" \
-  -e LIB_DIR=/plugin -e LIB_ASSEMBLY=CsLib.dll -e LIB_REGISTRAR=CsLib.StoreStartup.Configure \
+  -e LIB_ASSEMBLY=CsLib.dll -e LIB_REGISTRAR=CsLib.StoreStartup.Configure \
   -e SMB_SERVER=samba \
   "$IMAGE" >/dev/null 2>&1
 if code="$(wait_stopped "badcfg-${NET}")" && [ "$code" -ne 0 ]; then
@@ -437,8 +454,7 @@ fi
 docker rm -f "badcfg-${NET}" >/dev/null 2>&1 || true
 
 echo "== service registration =="
-start_host stampreal "${HERE}/publish/cslib" CsLib.dll CsLib.StoreStartup.Configure \
-  '{"CsLib.IStamp":"CsLib.RealStamp"}'
+start_host stampreal "${HERE}/publish/cslib" CsLib.dll CsLib.StoreStartup.Configure
 wait_healthy stampreal \
   && ok "constructs a type with a registered dependency" \
   || bad "constructs a type with a registered dependency"
@@ -447,33 +463,128 @@ api stampreal /invoke -X POST -H 'Content-Type: application/json' \
   -d '{"service":"CsLib.Store","method":"Stamp","args":[]}' | grep -q '"result":"real"' \
   && ok "resolves the registered implementation" || bad "resolves the registered implementation"
 
-# The same library, a different implementation, no rebuild: this is how you
-# substitute a fake for a dependency.
-start_host stampfake "${HERE}/publish/cslib" CsLib.dll CsLib.StoreStartup.Configure \
-  '{"CsLib.IStamp":"CsLib.FakeStamp"}'
-wait_healthy stampfake >/dev/null 2>&1
-api stampfake /invoke -X POST -H 'Content-Type: application/json' \
-  -d '{"service":"CsLib.Store","method":"Stamp","args":[]}' | grep -q '"result":"fake"' \
-  && ok "a fake can be substituted by configuration alone" \
-  || bad "a fake can be substituted by configuration alone"
+echo "== a plugin without a usable deps.json is refused at startup =="
+# The host resolves the plugin's RID-specific assemblies and native assets from
+# its deps.json. Without a usable one, AssemblyDependencyResolver resolves
+# nothing and every package falls back to the copy in the plugin root -- which
+# for Microsoft.Data.SqlClient is a stub whose members throw. Measured before
+# this guard existed: the container started, reported HEALTHY, and the first
+# call returned {"ok":false,"error":"Microsoft.Data.SqlClient is not supported
+# on this platform."} -- a message that reads as a database fault, arriving
+# arbitrarily long after the real mistake.
+#
+# Both shapes are covered because they fail differently and File.Exists only
+# catches the first: the file absent, and the file present but describing
+# nothing.
+DEPSDIR="$(mktemp -d)"
+cp -r "${HERE}/publish/cslib" "$DEPSDIR/none"
+rm -f "$DEPSDIR/none/CsLib.deps.json"
+cp -r "${HERE}/publish/cslib" "$DEPSDIR/empty"
+echo '{}' > "$DEPSDIR/empty/CsLib.deps.json"
+
+for shape in none empty; do
+  docker run -d --name "deps-${NET}" --network "${NET}" \
+    -v "$DEPSDIR/$shape:/plugin:ro" \
+    -e LIB_ASSEMBLY=CsLib.dll \
+    -e LIB_REGISTRAR=CsLib.SqlProbeStartup.Configure \
+    "$IMAGE" >/dev/null 2>&1
+  if code="$(wait_stopped "deps-${NET}")" && [ "$code" -ne 0 ] \
+     && docker logs "deps-${NET}" 2>&1 | grep -q "CsLib.deps.json"; then
+    ok "a plugin whose deps.json is '$shape' is refused at startup, naming the file"
+  else
+    docker logs "deps-${NET}" 2>&1 | tail -4
+    bad "a plugin whose deps.json is '$shape' is refused at startup, naming the file"
+  fi
+  docker rm -f "deps-${NET}" >/dev/null 2>&1 || true
+done
+rm -rf "$DEPSDIR"
+
+echo "== a removed configuration variable is refused, not ignored =="
+# Nothing covered this before: the guard in Program.cs that rejects LIB_TYPE
+# and LIB_OPTIONS had no test at any level, so deleting it would have broken
+# nothing. It matters because a config carried forward unchanged would
+# otherwise start cleanly and serve a graph that silently did not include what
+# the operator asked for -- which is the whole reason the guard exists.
+#
+# LIB_SERVICES joins them: interface-to-implementation overrides are gone, and
+# a startup that composes another startup and calls Replace expresses the same
+# thing in ordinary C# (CsLib.FakeStampStartup, exercised below).
+# NAME|VALUE, because the value that proves the point differs per variable:
+# a divergent one, not merely any one. LIB_DIR and LIB_PORT are the v4
+# additions -- both were real knobs that nothing ever turned, and both could
+# only break things if turned (LIB_PORT desynchronises from EXPOSE and from
+# WithRemoteFacade's hardcoded 8080; LIB_DIR from the bind mount the image
+# documents).
+for pair in 'LIB_TYPE|CsLib.Store' \
+            'LIB_OPTIONS|{"RootPath":"/tmp"}' \
+            'LIB_SERVICES|{"CsLib.IStamp":"CsLib.FakeStamp"}' \
+            'LIB_DIR|/somewhere-else' \
+            'LIB_PORT|9000'; do
+  gone="${pair%%|*}"
+  val="${pair#*|}"
+  docker run -d --name "gone-${NET}" --network "${NET}" \
+    -v "${HERE}/publish/cslib:/plugin:ro" \
+    -e LIB_ASSEMBLY=CsLib.dll \
+    -e LIB_REGISTRAR=CsLib.StoreStartup.Configure \
+    -e "${gone}=${val}" \
+    "$IMAGE" >/dev/null 2>&1
+  if code="$(wait_stopped "gone-${NET}")" && [ "$code" -ne 0 ] \
+     && docker logs "gone-${NET}" 2>&1 | grep -q "${gone}"; then
+    ok "${gone} is refused at startup, naming itself"
+  else
+    docker logs "gone-${NET}" 2>&1 | tail -4
+    bad "${gone} is refused at startup, naming itself"
+  fi
+  docker rm -f "gone-${NET}" >/dev/null 2>&1 || true
+done
+
+# "{}" must NOT count as set. It was LIB_OPTIONS's own default in v2 and
+# LIB_SERVICES's default in v3, so every harness and compose file in existence
+# passes it as inert filler -- refusing it would reject configurations that ask
+# for nothing at all. This is the same over-strict guard the codebase already
+# got wrong once and documented.
+# Each removed variable has ONE value that asks for exactly what it already
+# gets, and that value must stay inert: "{}" was LIB_OPTIONS's and
+# LIB_SERVICES's own default, and every harness in existence passes
+# LIB_DIR=/plugin and LIB_PORT=8080 because those WERE the defaults. Refusing
+# them would reject configurations that change nothing -- the same over-strict
+# guard this codebase already got wrong once and documented.
+docker run -d --name "inert-${NET}" --network "${NET}" --network-alias inert \
+  -v "${HERE}/publish/cslib:/plugin:ro" \
+  -e LIB_ASSEMBLY=CsLib.dll \
+  -e LIB_REGISTRAR=CsLib.StoreStartup.Configure \
+  -e LIB_OPTIONS='{}' -e LIB_SERVICES='{}' -e LIB_TYPE='' \
+  -e LIB_DIR=/plugin -e LIB_PORT=8080 \
+  "$IMAGE" >/dev/null 2>&1
+if wait_healthy inert; then
+  ok "each removed variable's own former default is still inert"
+else
+  docker logs "inert-${NET}" 2>&1 | tail -4
+  bad "each removed variable's own former default is still inert"
+fi
+docker rm -f "inert-${NET}" >/dev/null 2>&1 || true
 
 echo "== LIB_REGISTRAR wires the graph from the app's own code =="
 start_host reg "${HERE}/publish/cslib" CsLib.dll CsLib.Registration.AddCsLib
 wait_healthy reg \
-  && ok "registrar supplies dependencies with no LIB_SERVICES" \
-  || bad "registrar supplies dependencies with no LIB_SERVICES"
+  && ok "an extension-method registrar supplies its own dependencies" \
+  || bad "an extension-method registrar supplies its own dependencies"
 
 api reg /invoke -X POST -H 'Content-Type: application/json' \
   -d '{"service":"CsLib.Store","method":"Stamp","args":[]}' | grep -q '"result":"real"' \
   && ok "registrar's registration is used" || bad "registrar's registration is used"
 
-# The combination that matters: real wiring, one thing faked.
-start_host regfake "${HERE}/publish/cslib" CsLib.dll CsLib.Registration.AddCsLib \
-  '{"CsLib.IStamp":"CsLib.FakeStamp"}'
+# The combination that matters: real wiring, one thing faked. This is what
+# LIB_SERVICES existed for, and CsLib.FakeStampStartup is the whole of its
+# replacement -- a startup that calls the real composition root (an extension
+# method) and then Replace. If a substitution ever stopped applying, this case
+# would report "real" instead of "fake".
+start_host regfake "${HERE}/publish/cslib" CsLib.dll CsLib.FakeStampStartup.Configure
 wait_healthy regfake >/dev/null 2>&1
 api regfake /invoke -X POST -H 'Content-Type: application/json' \
   -d '{"service":"CsLib.Store","method":"Stamp","args":[]}' | grep -q '"result":"fake"' \
-  && ok "LIB_SERVICES overrides the registrar" || bad "LIB_SERVICES overrides the registrar"
+  && ok "a startup can compose real wiring and replace one dependency" \
+  || bad "a startup can compose real wiring and replace one dependency"
 
 echo "== an unregistered dependency is named when the call needs it =="
 # v2 caught this at startup: LIB_TYPE made the host construct the root before
@@ -497,7 +608,7 @@ echo "$MISSING_OUT" | grep -q "IStamp" \
 echo "== the startup is the only way to say what to serve =="
 docker run -d --name "croot-${NET}" --network "${NET}" --network-alias croot \
   -v "${HERE}/publish/cslib:/plugin:ro" \
-  -e LIB_DIR=/plugin -e LIB_ASSEMBLY=CsLib.dll \
+  -e LIB_ASSEMBLY=CsLib.dll \
   -e LIB_REGISTRAR=CsLib.GraphStartup.Configure \
   -e DOTNET_EnableDiagnostics=0 \
   "${IMAGE}" >/dev/null
@@ -512,7 +623,7 @@ docker run --rm --network "${NET}" curlimages/curl:8.10.1 -s -m 10 \
 echo "== a missing LIB_REGISTRAR is fatal =="
 docker run -d --name "noconfig-${NET}" --network "${NET}" \
   -v "${HERE}/publish/cslib:/plugin:ro" \
-  -e LIB_DIR=/plugin -e LIB_ASSEMBLY=CsLib.dll \
+  -e LIB_ASSEMBLY=CsLib.dll \
   -e DOTNET_EnableDiagnostics=0 \
   "${IMAGE}" >/dev/null
 if wait_stopped "noconfig-${NET}" \
@@ -663,7 +774,7 @@ echo "== a reset lands safely against calls already in flight =="
 # and then wedged every later call -- see task-5-report.md -- which is why
 # InstanceHolder holds no lock across the await.
 start_host inflight "${HERE}/publish/cslib" CsLib.dll CsLib.DisposableRootStartup.Configure \
-  '{}' /tmp /tmp/disposed-inflight
+  /tmp /tmp/disposed-inflight
 wait_healthy inflight && ok "the in-flight host constructs" \
                       || bad "the in-flight host constructs"
 
@@ -757,7 +868,7 @@ echo "== a plugin Dispose() that throws must not destroy an innocent caller's re
 # depends on scheduling, so the same plugin defect would destroy a different
 # arbitrary request every run.
 start_host disposethrow "${HERE}/publish/cslib" CsLib.dll CsLib.ThrowingDisposableRootStartup.Configure \
-  '{}' /tmp /tmp/throwing-disposed
+  /tmp /tmp/throwing-disposed
 wait_healthy disposethrow && ok "a root with a throwing Dispose() constructs" \
                           || bad "a root with a throwing Dispose() constructs"
 
@@ -953,18 +1064,8 @@ if wait_healthy nat; then
     bad "a plugin's native assets load with NO consumer configuration (got: $NAT_OUT)"
   fi
 
-  # The startup line is expected; a miss line is not. This is the guard for a
-  # regression that made every container log two msquic misses per boot,
-  # because the shared framework probes for optional native libraries and
-  # those declines are normal.
-  if docker logs "nat-${NET}" 2>&1 | grep -q "could not resolve"; then
-    bad "a successful native load logs no resolver misses"
-  else
-    ok "a successful native load logs no resolver misses"
-  fi
 else
   bad "a plugin's native assets load with NO consumer configuration (never healthy)"
-  bad "a successful native load logs no resolver misses (never healthy)"
 fi
 
 # Vacuity control. Without it, the case above could be passing because the
@@ -975,7 +1076,7 @@ cp -r "${HERE}/publish/nativelib" "$STRIP"
 rm -rf "$STRIP/runtimes"
 docker run -d --rm --name "natstrip-${NET}" --network "${NET}" --network-alias natstrip \
   -v "$STRIP:/plugin:ro" \
-  -e LIB_DIR=/plugin -e LIB_ASSEMBLY=NativeLib.dll \
+  -e LIB_ASSEMBLY=NativeLib.dll \
   -e LIB_REGISTRAR=NativeLib.NativeStartup.Configure \
   -e DOTNET_EnableDiagnostics=0 "$IMAGE" >/dev/null 2>&1
 if wait_healthy natstrip; then
@@ -988,12 +1089,18 @@ if wait_healthy natstrip; then
   # "The type initializer for 'LibGit2Sharp.Core.NativeMethods' threw an
   # exception", which names neither the library nor the reason, and the real
   # cause sits two levels down an InnerException chain no test output shows.
+  #
+  # runtimes/ is gone, but the search path is NOT empty: the entrypoint also
+  # adds the plugin root, because a RID-specific publish flattens native assets
+  # into it. So this is the "searched, found nothing" fault, and the case below
+  # that bypasses the entrypoint is the "nothing to search" one. Two different
+  # fixes, which is why the message distinguishes them.
   if echo "$STRIP_OUT" | grep -q "native library" \
      && echo "$STRIP_OUT" | grep -q "rid=" \
-     && echo "$STRIP_OUT" | grep -q "searched"; then
-    ok "the failure names the library, the host rid, and the directories searched"
+     && echo "$STRIP_OUT" | grep -q "searched /plugin"; then
+    ok "the failure names the library, the host rid, and what to check"
   else
-    bad "the failure names the library, the host rid, and the directories searched (got: $STRIP_OUT)"
+    bad "the failure names the library, the host rid, and what to check (got: $STRIP_OUT)"
   fi
 else
   bad "with native assets removed the SAME call fails (never healthy)"
@@ -1002,26 +1109,35 @@ fi
 docker rm -f "natstrip-${NET}" >/dev/null 2>&1 || true
 rm -rf "$(dirname "$STRIP")"
 
-# The managed resolver on its own, with the entrypoint script bypassed so
-# nothing is on LD_LIBRARY_PATH. The two layers cover different failures --
-# the script exists for native-to-native dlopen, which no managed hook sees --
-# so proving only the combination works would leave either one free to rot.
-docker run -d --rm --name "natmgd-${NET}" --network "${NET}" --network-alias natmgd \
+# The entrypoint is what makes native assets findable, so bypassing it must
+# FAIL. This replaces a case asserting the opposite: a managed
+# ResolvingUnmanagedDll hook used to resolve them with nothing on
+# LD_LIBRARY_PATH. That hook was removed once it was measured never to fire
+# while the entrypoint ran -- it fires only after default probing fails, and
+# default probing is dlopen, which reads the very path the entrypoint sets.
+#
+# Asserted rather than left untested because it is now a real constraint on
+# consumers: --entrypoint dotnet, or any orchestrator that overrides the
+# entrypoint, loses native assets.
+docker run -d --rm --name "natbypass-${NET}" --network "${NET}" --network-alias natbypass \
   --entrypoint dotnet \
   -v "${HERE}/publish/nativelib:/plugin:ro" \
-  -e LIB_DIR=/plugin -e LIB_ASSEMBLY=NativeLib.dll \
+  -e LIB_ASSEMBLY=NativeLib.dll \
   -e LIB_REGISTRAR=NativeLib.NativeStartup.Configure \
   -e DOTNET_EnableDiagnostics=0 "$IMAGE" \
   /app/RemoteFacadeHost.dll >/dev/null 2>&1
-if wait_healthy natmgd; then
-  MGD_OUT=$(api natmgd /invoke -X POST -H 'Content-Type: application/json' -d '{"service":"NativeLib.IGitProbe","method":"InitAndCommit","args":["/tmp/natrepo"]}')
-  echo "$MGD_OUT" | grep -qE '"result":"[0-9a-f]{40}"' \
-    && ok "the managed resolver alone resolves native assets, with no LD_LIBRARY_PATH" \
-    || bad "the managed resolver alone resolves native assets (got: $MGD_OUT)"
+if wait_healthy natbypass; then
+  BYPASS_OUT=$(api natbypass /invoke -X POST -H 'Content-Type: application/json' -d '{"service":"NativeLib.IGitProbe","method":"InitAndCommit","args":["/tmp/natrepo"]}')
+  if echo "$BYPASS_OUT" | grep -q '"ok":false' \
+     && echo "$BYPASS_OUT" | grep -q "no native asset directories"; then
+    ok "bypassing the entrypoint loses native assets, and the error says why"
+  else
+    bad "bypassing the entrypoint loses native assets, and the error says why (got: $BYPASS_OUT)"
+  fi
 else
-  bad "the managed resolver alone resolves native assets (never healthy)"
+  bad "bypassing the entrypoint loses native assets (never healthy)"
 fi
-docker rm -f "natmgd-${NET}" >/dev/null 2>&1 || true
+docker rm -f "natbypass-${NET}" >/dev/null 2>&1 || true
 
 echo "== wire-format baseline vs the previous release =="
 if sh "${HERE}/baseline.sh" "${IMAGE}"; then
