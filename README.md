@@ -22,11 +22,30 @@ No code generation. Your test already references the library for its
 interface, so a `DispatchProxy` implements it and the compiler checks the
 contract.
 
-> **v3 is breaking.** Single-class hosting (`LIB_TYPE`, `LIB_OPTIONS`) and the
-> client's `RemoteFacade.For<T>(url)` are gone — a startup is the only way to
-> host, `RemoteHost` the only way to call. Callbacks (`LIB_CALLBACKS`,
-> `CallbackHost`) are out for now and preserved on the `callbacks` branch;
-> write a startup that substitutes the dependency meanwhile.
+> **v4 is breaking.** Four things changed, and each fails loudly at startup
+> rather than drifting:
+>
+> - **`LIB_SERVICES` is gone.** Substitute a dependency with a startup that
+>   calls your real one and then `services.Replace(...)` — see [Substituting a
+>   dependency](#substituting-a-dependency). Unlike the old map, that lets you
+>   choose the lifetime.
+> - **The plugin's `.deps.json` is required.** Mount `dotnet publish` output,
+>   not a project or `bin` directory. Without it a package shipping a reference
+>   stub at its root would load the stub and fail much later, naming the wrong
+>   thing.
+> - **`LIB_DIR` and `LIB_PORT` are gone.** The mount is always `/plugin` and the
+>   host always listens on `8080`; map the port with Docker's own `-p`.
+> - **Don't override the entrypoint.** It is what puts the plugin's native
+>   assets on the loader's search path, and it is now the only thing that does.
+>
+> Setting any removed variable is a fatal startup error naming the replacement,
+> except when set to its own former default — so a harness passing
+> `LIB_DIR=/plugin` or `LIB_SERVICES={}` keeps working untouched.
+>
+> **v3 was breaking too.** Single-class hosting (`LIB_TYPE`, `LIB_OPTIONS`) and
+> the client's `RemoteFacade.For<T>(url)` went then — a startup is the only way
+> to host, `RemoteHost` the only way to call. Callbacks (`LIB_CALLBACKS`,
+> `CallbackHost`) remain out and preserved on the `callbacks` branch.
 
 ## Quick start
 
@@ -53,7 +72,7 @@ dotnet publish MyApp.csproj -o ./publish
 docker run -v "$(pwd)/publish:/plugin:ro" \
   -e LIB_ASSEMBLY=MyApp.dll \
   -e LIB_REGISTRAR=MyApp.TestStartup.Configure \
-  -p 8080:8080 ghcr.io/drewlane-dev/remote-facade-host:3.3.2
+  -p 8080:8080 ghcr.io/drewlane-dev/remote-facade-host:4.0.0
 ```
 
 Then drive it. With [Testcontainers](https://dotnet.testcontainers.org/), the
@@ -96,7 +115,7 @@ sequenceDiagram
     participant host as Container :8080
     participant real as Your real instance
 
-    Note over proxy: RemoteFacade.For#lt;IStore#gt;(url)<br/>a DispatchProxy, no codegen
+    Note over proxy: host.GetAsync#lt;IStore#gt;()<br/>a DispatchProxy, no codegen
 
     test->>proxy: store.WriteAsync("a.txt", "hi")
     proxy->>host: POST /invoke<br/>{ method, args, service? }
@@ -177,7 +196,7 @@ Testcontainers.
 
 ```csharp
 await using var container = new ContainerBuilder()
-    .WithImage("ghcr.io/drewlane-dev/remote-facade-host:3.3.2")
+    .WithImage("ghcr.io/drewlane-dev/remote-facade-host:4.0.0")
     .WithRemoteFacade(typeof(TestStartup), pluginDir)
     .WithOptions(new StoreOptions { RootPath = "/mnt/share" })
     .WithSmbMount(new SmbMount { Server = "samba", Share = "data" })
